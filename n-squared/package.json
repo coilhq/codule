@@ -1,0 +1,16 @@
+{
+  "name": "n-squared",
+  "version": "1.0.0",
+  "description": "Basic facilities for communicating among hosts of a distributed contract.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "Ethan MacBrough",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "reconnecting-websocket": "^4.0.0-rc3",
+    "tweetnacl": "^1.0.0",
+    "ws": "^5.2.0"
+  }
+}
