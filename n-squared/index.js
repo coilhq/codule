@@ -78,22 +78,27 @@ function RWebSocket(target) {
 // -----------------------------------------------------------------------------
 
 // Upon receiving the public key of the node being connected to, sends
-// the shared Diffie-Hellman key as an authentication mechanism and begins
-// sending normal messages to that node.
-function authOut(peerName, skey, thisHostIndex, soc, resolve, reject) {
-  return peerpkey => {
+// the shared Diffie-Hellman key as an authentication mechanism.
+// Once we receive an acknowledgement that the auth succeeded, we begin
+// sending messages normally.
+function authOut(peerName, skey, thisHostIndex, soc) {
+  const dhkey = defer(), authedSoc = defer()
+  soc.once(peerpkey => {
     if (peerpkey.length !== 2*nacl.scalarMult.groupElementLength) {
-      console.error('\x1b[31m%s\x1b[0m', 'Invalid public key received from '+peerName+'! (' + peerpkey + ')')
+      console.error('\x1b[31m%s\x1b[0m', 'Invalid public key received from '
+                                            +peerName+'! (' + peerpkey + ')')
       soc.destroy()
-      //reject()
       return
     }
     
-    const dhkey = nacl.scalarMult(skey, dehex(peerpkey))
-    soc.send('_connect '+thisHostIndex+' '+hex(dhkey))
+    const dhkeyVal = nacl.scalarMult(skey, dehex(peerpkey))
+    soc.send('_connect '+thisHostIndex+' '+hex(dhkeyVal))
     console.log('\x1b[36m%s\x1b[0m', 'Successfully connected to ' + peerName + '.')
-    resolve([soc, dhkey])
-  }
+    dhkey.resolve(dhkeyVal)
+    soc.once(m => authedSoc.resolve(soc))
+  })
+  
+  return { dhkey:dhkey.promise, soc:authedSoc.promise }
 }
 
 // -----------------------------------------------------------------------------
@@ -143,17 +148,15 @@ module.exports = function getBroker() {
                                    : host.host
   })
 
-
-
-  //const skey = easyrand(nacl.scalarMult.scalarLength)
+  // TODO: const skey = easyrand(nacl.scalarMult.scalarLength)
   const skey = nacl.randomBytes(nacl.scalarMult.scalarLength)
   const pkey = nacl.scalarMult.base(skey)
 
   const rawOutSockets = hosts.map(host => new RWebSocket(host))
-  const onceConnected = rawOutSockets.map((soc,i) => new Promise((res, rej) => {
+  const authedSockets = rawOutSockets.map((soc,i) => {
                           soc.send('_open')
-                          soc.once(authOut(hostNames[i], skey, thisHostIndex, soc, res, rej))
-                        }))
+                          return authOut(hostNames[i], skey, thisHostIndex, soc)
+                        })
 
   const messageHandler = createMessageHandler()
 
@@ -165,40 +168,43 @@ module.exports = function getBroker() {
     soc.on('message', data => {
       console.log('message received: ' + data)
       const [ command, ...params ] = data.split(' ')
+
       if (command === '_open') {
+        // On connection we send our public key and await auth.
         soc.send(hex(pkey))
-      }
-      if (command === '_connect') {
+      } else if (command === '_connect') {
+        // Upon receiving the auth, we verify it's the correct DH key, then
+        // authorize the socket and send back an empty ack.
         const [ otherNode, receivedDhkey ] = params
         
-        onceConnected[otherNode].then(([_, dhkey]) => {
-          if (!nacl.verify(dehex(receivedDhkey), dhkey)) {
+        authedSockets[otherNode].dhkey.then(dhkey => {
+          if (nacl.verify(dehex(receivedDhkey), dhkey)) {
+            soc.send('')
+            authed = otherNode
+            console.log('\x1b[36m%s\x1b[0m', hostNames[otherNode] + ' connected successfully.')
+          } else {
             soc.destroy()
-            return
+            console.log('\x1b[31m%s\x1b[0m', 'Failed to authenticate incoming connection.')
           }
-
-          messageQueue.forEach((m, tag) => messageHandler.receiveMessage(otherNode, tag, m))
-          authed = otherNode
-          console.log('\x1b[36m%s\x1b[0m', hostNames[otherNode] + ' connected successfully.')
         })
-      } else {
-        const taggedMessage = decodeTag(data)
-        if (authed === -1) messageQueue.set(taggedMessage.tag, taggedMessage.message)
-        else messageHandler.receiveMessage(authed, taggedMessage.tag, taggedMessage.message)
+      } else if (authed !== -1) {
+        // Handle the message only if the socket has already been authed.
+        const { tag, message } = decodeTag(data)
+        messageHandler.receiveMessage(authed, tag, message)
       }
     })
   })
   
   // Send functions that can be called at any time and only send
   // the message AFTER the receiver connects
-  const sendArray = onceConnected.map(connected => 
-    (tag, message) => connected.then(([soc, _]) => 
+  const sendArray = authedSockets.map(connected => 
+    (tag, message) => connected.soc.then(soc => 
       soc.send(encodeTag(tag, message), error => { })))
   
   return {
     send: (tag, mFunc) => sendArray.forEach((send, i) => send(tag, mFunc(i))),
     broadcast: (tag, m) => sendArray.forEach(send => send(tag, m)),
     receive: (tag, cb) => hostNames.map((_,i) => messageHandler.onMessage(i, tag, m=>cb(i, m))),
-    allConnected:Promise.all(onceConnected).then(() => undefined)
+    allConnected:Promise.all(authedSockets.map(a => a.soc)).then(() => undefined)
   }
 }
