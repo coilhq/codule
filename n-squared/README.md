@@ -1,3 +1,20 @@
 # n-squared
 
-https://engineering.circle.com/https-authorized-certs-with-node-js-315e548354a2
+A module for setting up distributed communication between Codius hosts.
+
+This module is currently in ALPHA. It is not safe to use in a production environment. In particular, connections are done over plain websockets. Since the security of our bilateral-authentication mechanism assumes that communication is encrypted and servers are authenticated, this makes the module useless against attack attackers.
+
+The API is modeled after a tagged-message reactive style that is commonly used in distributed systems. All messages are sent with a tag that indicates which part of the program it corresponds to. The API is designed to be asynchronously safe: message listeners can be attached before OR after the corresponding message is delivered without affecting the program. If a node sends multiple messages with the same tag, all but the first message is ignored.
+
+Example of use:
+```
+const broker = require('n-squared')()
+
+broker.receive('test_tag', (i, m) => console.log('Received a test_tag message from node #' + i + ': ' + m))
+broker.receive('test_tag2', (i, m) => console.log('Received a test_tag2 message from node #' + i + ': ' + m))
+
+broker.broadcast('test_tag', 'Hello World!')
+broker.send('test_tag', i => 'Hello node #' + i)
+
+broker.allConnected.then(() => console.log('All nodes have connected!'))
+```
