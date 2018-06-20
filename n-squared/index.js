@@ -139,19 +139,16 @@ module.exports = function getBroker() {
   hostNames.sort()
   
   const thisHostIndex = hostNames.indexOf(thisHostName)
-  
-  const hosts = hostNames.map(hostStr => new url.URL(hostStr))
-  const thisHost = new url.URL(thisHostName)
-  hosts.forEach(host => {
-    host.protocol = 'ws:'
-    host.host = process.env.CODIUS ? process.env.CODIUS_MANIFEST_HASH + '.' + host.host
-                                   : host.host
+  const hosts = hostNames.map(hostStr => {
+    const hostProtocol = 'ws://'
+    const hostHash = process.env.CODIUS ? process.env.CODIUS_MANIFEST_HASH + '.' : ''
+    hostStr = hostProtocol + hostHash + hostStr
+    return new url.URL(hostStr)
   })
-
+  const thisHost = new url.URL(thisHostName)
   // TODO: const skey = easyrand(nacl.scalarMult.scalarLength)
   const skey = nacl.randomBytes(nacl.scalarMult.scalarLength)
   const pkey = nacl.scalarMult.base(skey)
-
   const rawOutSockets = hosts.map(host => new RWebSocket(host))
   const authedSockets = rawOutSockets.map((soc,i) => {
                           soc.send('_open')
@@ -160,7 +157,7 @@ module.exports = function getBroker() {
 
   const messageHandler = createMessageHandler()
 
-  const server = new WebSocket.Server({ port:thisHost.port })
+  const server = new WebSocket.Server({ port:Number(thisHost.port) })
   server.on('connection', soc => {
     let authed = -1
     const messageQueue = new Map()
