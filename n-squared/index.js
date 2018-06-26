@@ -43,87 +43,259 @@ function asyncMap() {
 
 // -----------------------------------------------------------------------------
 
-// Basic websocket emulator that handles connecting to unopened servers
+// Websocket wrapper that handles connecting to unopened servers, authenticating,
 // and reconnecting when the connection goes down automatically.
-function RWebSocket(target) {
-  let delay1 = 1, delay2 = 0
+// Provides an abstract implementation of the "reliable channel" assumption;
+// i.e., any message sent is guaranteed to eventually be delivered.
+function RWebSocket(thisHostIndex, target, peerName, skey, onAddDhKey) {
+  function backoff(connect) {
+    let d = 400, maxd = 4000, avg = 400, i = 0, hist = [], open = false
+    
+    function loop() {
+      setTimeout(() => {
+        if (hist.filter(e => !e.closed).length > 0) {
+          if (d >= maxd) {
+            console.log('\x1b[31m%s\x1b[0m', 'connection to ' + peerName + ' timed out. reconnecting...')
+            open = false
+            maxd *= 1.5
+            while (hist.find(e => e.isConnectionEvent)) {
+              hist.splice(hist.findIndex(e => e.isConnectionEvent), 1)
+            }
+            
+            const i_ = i
+            back.createEvent(() => connect(d).then(_ => { open = true; back.closeEvent(i_) }), true)
+          } else {
+            let exceeded = false
+            hist.forEach(e => {
+              if (!e.closed) {
+                if (e.executionCount > 0) exceeded = true
+                e.executionCount++
+                
+                e.execute()
+              }
+            })
+
+            if (exceeded) {
+              d = Math.pow(Math.cbrt(d)+1, 3)
+            }
+          }
+        }
+        
+        loop()
+      }, d)
+    }
+
+    const back = {
+      createEvent: (execute, conn = false) => {
+        const e = {
+          index: i++,
+          executionCount: 0,
+          startTime: new Date(),
+          totalTime: 0,
+          execute,
+          closed: false,
+          isConnectionEvent: conn
+        }
+        
+        hist.push(e)
+        
+        return e.index
+      },
+      closeEvent: (index) => {
+        const e = hist.find(_e => _e.index === index)
+        if (!e) return;
+
+        e.closed = true
+        e.totalTime = new Date() - e.startTime
+        
+        const closedHist = hist.filter(e => e.closed)
+
+        while(closedHist.length > 100) {
+          hist.splice(hist.indexOf(closedHist.shift()), 1)
+        }
+        
+        avg = closedHist.reduce((s, _e) => s + _e.totalTime) / closedHist.length
+        if (closedHist.length >= 50) {
+          d = Math.min((10*maxd + avg) / 11, d)
+          maxd = Math.min((50*maxd + d*10) / 51, maxd)
+        }
+      },
+      connected: () => open
+    }
+    
+    const i_ = i
+    back.createEvent(() => connect(d).then(_ => { open = true; back.closeEvent(i_) }), true)
+    loop()
+    
+    return back
+  }
+
+  function authSoc(soc) {
+    const authed = defer()
+    soc.once('message', peerpkey => {
+      // Remove underscore
+      peerpkey = peerpkey.substring(1)
+
+      if (peerpkey.length !== 2*nacl.scalarMult.groupElementLength) {
+        console.error('\x1b[31m%s\x1b[0m', 'invalid public key received from '
+                                              +peerName+'! (' + peerpkey + ')')
+        soc.close()
+        return
+      }
+      
+      const dhkey = nacl.scalarMult(skey, dehex(peerpkey))
+      soc.send('_connect '+thisHostIndex+' '+hex(dhkey), err => { })
+      onAddDhKey(dhkey)
+      soc.once('message', _ => {
+        authed.resolve()
+        console.log('\x1b[36m%s\x1b[0m', 'successfully connected to ' + peerName + '.')
+      })
+    })
+
+    soc.send('_open', err => { })
+    
+    return authed.promise
+  }
   
-  function tryOpen() {
-    const ws = new WebSocket(target)
+  function tryOpen(d) {
+    const startTime = new Date()
+    const ws = new WebSocket(target, [], { handshakeTimeout: d - 10 })
     const ret = defer()
     
     ws.on('open', () => {
-      console.log('opened socket to remote peer.')
-      ret.resolve(ws)
+      let authed = false
+      ret.resolve(authSoc(ws).then(_ => { authed = true; return ws }))
+      
+      setTimeout(() => { if (!authed) ws.close() }, d - (new Date() - startTime))
     })
+
     ws.on('error', err => {
-      // n^2 backoff, capped at 5 minutes
-      ;[ delay1, delay2 ] = [ 2*delay1-delay2+2, delay1 ]
-      setTimeout(() => ret.resolve(tryOpen()), Math.min(delay1, 300000))
+      console.log('outgoing socket error.')
     })
     
     return ret.promise
   }
+  
+  const pings = [ ]
 
-  const socp = tryOpen()
+  function ping(back, ws) {
+    setTimeout(() => {
+      if (back.connected)
+        pings.push(back.createEvent(() => ws.send('_ping')))
+      ping(back, ws)
+    }, 30000)
+  }
+  
+  let ws = { send: m => { } }, sendQueue = new Map()
+  const back = backoff(d => tryOpen(d).then(_ws => {
+    ws.send = m => _ws.send(m, err => { })
+    _ws.on('message', data => {
+      const [ command, ...ackS ] = data.split(' ')
+      const ack = ackS.join(' ')
+
+      if (command === '_ack') {
+        if (!sendQueue.has(ack)) return;
+
+        let e = sendQueue.get(ack)
+        sendQueue.delete(ack)
+        back.closeEvent(e)
+      } else if (command === '_pong') {
+        pings.forEach(e => back.closeEvent(e))
+        pings.splice(0, pings.length)
+      }
+    })
+  }))
+  
+  ping(back, ws)
   
   return {
-    send: m => socp.then(ws => ws.send(m)),
-    onmessage: cb => socp.then(ws => ws.on('message', cb)),
-    once: cb => socp.then(ws => ws.once('message', cb)),
-    destroy: () => socp.then(ws => ws.close())
+    send: (epoch, tag, m) => {
+      const encMes = '_mes ' + epoch.length + ' ' + tag.length + ' ' + epoch + tag + m
+      sendQueue.set(epoch.length + ' ' + epoch + tag, back.createEvent(() => ws.send(encMes)))
+    },
+    clearEpoch: epoch => sendQueue.forEach((_, key) => {
+      if (key.startsWith(epoch.length + ' ' + epoch)) sendQueue.delete(key)
+    })
   }
 }
 
 // -----------------------------------------------------------------------------
 
-// Upon receiving the public key of the node being connected to, sends
-// the shared Diffie-Hellman key as an authentication mechanism.
-// Once we receive an acknowledgement that the auth succeeded, we begin
-// sending messages normally.
-function authOut(peerName, skey, thisHostIndex, soc) {
-  const dhkey = defer(), authedSoc = defer()
-  soc.once(peerpkey => {
-    if (peerpkey.length !== 2*nacl.scalarMult.groupElementLength) {
-      console.error('\x1b[31m%s\x1b[0m', 'Invalid public key received from '
-                                            +peerName+'! (' + peerpkey + ')')
-      soc.destroy()
-      return
-    }
-    
-    const dhkeyVal = nacl.scalarMult(skey, dehex(peerpkey))
-    soc.send('_connect '+thisHostIndex+' '+hex(dhkeyVal))
-    console.log('\x1b[36m%s\x1b[0m', 'Successfully connected to ' + peerName + '.')
-    dhkey.resolve(dhkeyVal)
-    soc.once(m => authedSoc.resolve(soc))
-  })
+function RWebSocketServer(port, n, skey, pkey, usernames, dhkeys) {
+  const server = new WebSocket.Server({ port })
+  let messageListeners = new Map()
+  const connectedD = [...Array(n)].map(_ => defer())
+
+  server.on('connection', soc => {
+    let authedAs = -1
   
-  return { dhkey:dhkey.promise, soc:authedSoc.promise }
-}
+    soc.on('message', data => {
+      const [ command, ...params ] = data.split(' ')
 
-// -----------------------------------------------------------------------------
+      if (authedAs === -1) {
+        if (command === '_open') {
+          // On connection we send our public key and await auth.
+          soc.send('_'+hex(pkey))
+        } else if (command === '_connect') {
+          // Upon receiving the auth, we verify it's the correct DH key, then
+          // authorize the socket and send back an empty ack.
+          const [ otherNode, receivedDhkey ] = params
+          
+          if (dhkeys[otherNode]) {
+            if (nacl.verify(dehex(receivedDhkey), dhkeys[otherNode])) {
+              soc.send('_')
+              authedAs = otherNode
+              connectedD[otherNode].resolve()
+              console.log('\x1b[36m%s\x1b[0m', usernames[otherNode] + ' connected successfully.')
+            } else {
+              soc.close()
+              console.log('\x1b[31m%s\x1b[0m', 'failed to authenticate an incoming connection.')
+            }
+          } else {
+            soc.close()
+          }
+        }
+      } else {
+        if (command === '_mes') {
+          const epochLength = parseInt(params[0], 10), 
+                tagLength = parseInt(params[1], 10),
+                taggedMes = params[2]
+          const epoch = taggedMes.slice(0, epochLength)
+          const tag = taggedMes.slice(epochLength, epochLength + tagLength)
+          const m = taggedMes.slice(epochLength + tagLength)
+          const epochTag = epochLength + ' ' + epoch + tag
+          console.log('message received from ' + usernames[authedAs] + ' at [' + epoch + ', ' + tag + ']: ' + m)
+          
+          if (messageListeners.has(epochTag)) {
+            soc.send('_ack ' + epochTag, err => { })
+            if (messageListeners.get(epochTag)(authedAs, m)) {
+              setTimeout(() => messageListeners.delete(epochTag), 60000)
+            }
+          }
+        } else if (command === '_ping') {
+          soc.send('_pong', err => { })
+        }
+      }
+    })
+  })
 
-function encodeTag (tag, message) {
-  return tag.length+' '+tag+message
-}
-
-function decodeTag (data) {
-  const [ length, ...taggedMessageA] = data.split(' ')
-  const taggedMessage = taggedMessageA.join(' ')
-  const tag = taggedMessage.slice(0, length)
-  const message = taggedMessage.slice(length)
-  return { tag, message }
-}
-
-// Stores a map of promises that allows asynchronous message receipt.
-// Attaching a listener for a certain tag can be done before
-// or after that message is received with no issue.
-function createMessageHandler() {
-  let map = asyncMap()
-  const itag = (hostIndex, tag) => hostIndex+':'+tag
   return {
-    receiveMessage: (hostIndex, tag, message) => map.set(itag(hostIndex, tag), message),
-    onMessage: (hostIndex, tag, cb) => map.get(itag(hostIndex, tag)).then(cb)
+    connected: connectedD.map(d => d.promise),
+    onMessage: (epoch, tag, cb) => {
+      const epochTag = epoch.length + ' ' + epoch + tag
+      const recd = [...Array(n)].map(_ => false)
+      const listener = (i, m) => {
+        if (!recd[i]) cb(i, m)
+        
+        recd[i] = true
+        return recd.every(t => t)
+      }
+      
+      messageListeners.set(epochTag, listener)
+    },
+    clearEpoch: epoch => messageListeners.forEach((_, key) => {
+      if (key.startsWith(epoch.length + ' ' + epoch)) messageListeners.delete(key)
+    })
   }
 }
 
@@ -133,14 +305,19 @@ function createMessageHandler() {
 // interface for interacting with these hosts and adding reactive logic
 // when messages are received.
 module.exports = function getBroker() {
+  const thisUsername = process.env.USERNAME
   const thisHostName = process.env.CODIUS_HOST
-  const hostNames = JSON.parse(process.env.CONTRACT_INSTANCES)
-  if (!hostNames.includes(thisHostName)) hostNames.push(thisHostName)
-  hostNames.sort()
+  let hostPairs = JSON.parse(process.env.CONTRACT_INSTANCES)
+  if (!hostPairs.find(([a,b]) => a === thisUsername && b === thisHostName))
+    hostPairs.push([thisUsername, thisHostName])
+  hostPairs = hostPairs.map(([a]) => a).sort().map(a => hostPairs.find(([_a]) => a === _a))
+  const usernames = hostPairs.map(([a]) => a)
+
+  const n = usernames.length
   
-  const thisHostIndex = hostNames.indexOf(thisHostName)
+  const thisHostIndex = usernames.indexOf(thisUsername)
   
-  const hosts = hostNames.map(hostStr => new url.URL(hostStr))
+  const hosts = hostPairs.map(([_, hostStr]) => new url.URL(hostStr))
   const thisHost = new url.URL(thisHostName)
   hosts.forEach(host => {
     host.protocol = 'ws:'
@@ -148,63 +325,26 @@ module.exports = function getBroker() {
                                    : host.host
   })
 
-  // TODO: const skey = easyrand(nacl.scalarMult.scalarLength)
   const skey = nacl.randomBytes(nacl.scalarMult.scalarLength)
   const pkey = nacl.scalarMult.base(skey)
 
-  const rawOutSockets = hosts.map(host => new RWebSocket(host))
-  const authedSockets = rawOutSockets.map((soc,i) => {
-                          soc.send('_open')
-                          return authOut(hostNames[i], skey, thisHostIndex, soc)
-                        })
+  const dhkeys = [...Array(n)]
 
-  const messageHandler = createMessageHandler()
-
-  const server = new WebSocket.Server({ port:thisHost.port })
-  server.on('connection', soc => {
-    let authed = -1
-    const messageQueue = new Map()
+  const outSocs = hosts.map((host, i) => 
+      RWebSocket(thisHostIndex, host, usernames[i], skey, dhkey => { dhkeys[i] = dhkey }))
   
-    soc.on('message', data => {
-      console.log('message received: ' + data)
-      const [ command, ...params ] = data.split(' ')
-
-      if (command === '_open') {
-        // On connection we send our public key and await auth.
-        soc.send(hex(pkey))
-      } else if (command === '_connect') {
-        // Upon receiving the auth, we verify it's the correct DH key, then
-        // authorize the socket and send back an empty ack.
-        const [ otherNode, receivedDhkey ] = params
-        
-        authedSockets[otherNode].dhkey.then(dhkey => {
-          if (nacl.verify(dehex(receivedDhkey), dhkey)) {
-            soc.send('')
-            authed = otherNode
-            console.log('\x1b[36m%s\x1b[0m', hostNames[otherNode] + ' connected successfully.')
-          } else {
-            soc.destroy()
-            console.log('\x1b[31m%s\x1b[0m', 'Failed to authenticate incoming connection.')
-          }
-        })
-      } else if (authed !== -1) {
-        // Handle the message only if the socket has already been authed.
-        const { tag, message } = decodeTag(data)
-        messageHandler.receiveMessage(authed, tag, message)
-      }
-    })
-  })
-  
-  // Send functions that can be called at any time and only send
-  // the message AFTER the receiver connects
-  const sendArray = authedSockets.map(connected => 
-    (tag, message) => connected.soc.then(soc => 
-      soc.send(encodeTag(tag, message), error => { })))
+  const server = RWebSocketServer(process.env.PORT, n, skey, pkey, usernames, dhkeys)
   
   return {
-    send: (tag, mFunc) => sendArray.forEach((send, i) => send(tag, mFunc(i))),
-    broadcast: (tag, m) => sendArray.forEach(send => send(tag, m)),
-    receive: (tag, cb) => hostNames.map((_,i) => messageHandler.onMessage(i, tag, m=>cb(i, m))),
-    allConnected:Promise.all(authedSockets.map(a => a.soc)).then(() => undefined)
+    broadcast: (epoch, tag, m) => outSocs.forEach(soc => soc.send(epoch, tag, m)),
+    receive: (epoch, tag, cb) => server.onMessage(epoch, tag, cb),
+    allConnected: Promise.all(server.connected).then(() => undefined),
+    kConnected: k => {
+      const ret = defer()
+      let c = 0
+      server.connected.forEach(p => p.then(() => { c++; if (c>=k) ret.resolve() }))
+      return ret.promise
+    },
+    n
   }
 }
