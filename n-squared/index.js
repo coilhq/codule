@@ -336,8 +336,8 @@ module.exports = function getBroker() {
   const server = RWebSocketServer(process.env.PORT, n, skey, pkey, usernames, dhkeys)
   
   return {
-    broadcast: (epoch, tag, m) => outSocs.forEach(soc => soc.send(epoch, tag, m)),
-    receive: (epoch, tag, cb) => server.onMessage(epoch, tag, cb),
+    broadcast: (epoch, tag, m) => outSocs.forEach(soc => soc.send(''+epoch, ''+tag, m)),
+    receive: (epoch, tag, cb) => server.onMessage(''+epoch, ''+tag, cb),
     allConnected: Promise.all(server.connected).then(() => undefined),
     kConnected: k => {
       const ret = defer()
