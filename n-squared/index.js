@@ -259,7 +259,7 @@ function RWebSocketServer(port, n, skey, pkey, usernames, dhkeys) {
         if (command === '_mes') {
           const epochLength = parseInt(params[0], 10), 
                 tagLength = parseInt(params[1], 10),
-                taggedMes = params[2]
+                taggedMes = params.slice(2).join(' ')
           const epoch = taggedMes.slice(0, epochLength)
           const tag = taggedMes.slice(epochLength, epochLength + tagLength)
           const m = taggedMes.slice(epochLength + tagLength)
