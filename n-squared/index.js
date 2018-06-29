@@ -337,6 +337,8 @@ module.exports = function getBroker() {
   
   return {
     broadcast: (epoch, tag, m) => outSocs.forEach(soc => soc.send(''+epoch, ''+tag, m)),
+    send: (epoch, tag, mFunc) => outSocs.forEach((soc,i) => soc.send(''+epoch, ''+tag, mFunc(i))),
+    sendTo: (epoch, tag, i, m) => outSocs[i].send(''+epoch, ''+tag, mF),
     receive: (epoch, tag, cb) => server.onMessage(''+epoch, ''+tag, cb),
     allConnected: Promise.all(server.connected).then(() => undefined),
     kConnected: k => {
