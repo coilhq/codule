@@ -345,6 +345,7 @@ module.exports = function getBroker() {
       server.connected.forEach(p => p.then(() => { c++; if (c>=k) ret.resolve() }))
       return ret.promise
     },
+    thisHostIndex,
     n
   }
 }
