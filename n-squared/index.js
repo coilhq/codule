@@ -293,6 +293,18 @@ function RWebSocketServer(port, n, skey, pkey, usernames, dhkeys) {
       
       messageListeners.set(epochTag, listener)
     },
+    onMessageFrom: (epoch, tag, sender, cb) => {
+      const epochTag = epoch.length + ' ' + epoch + tag
+      const recd = [...Array(n)].map(_ => false)
+      const listener = (i, m) => {
+        if (i === sender) {
+          cb(m)
+          return true
+        }
+      }
+      
+      messageListeners.set(epochTag, listener)
+    },
     clearEpoch: epoch => messageListeners.forEach((_, key) => {
       if (key.startsWith(epoch.length + ' ' + epoch)) messageListeners.delete(key)
     })
@@ -340,6 +352,7 @@ module.exports = function getBroker() {
     send: (epoch, tag, mFunc) => outSocs.forEach((soc,i) => soc.send(''+epoch, ''+tag, mFunc(i))),
     sendTo: (epoch, tag, i, m) => outSocs[i].send(''+epoch, ''+tag, m),
     receive: (epoch, tag, cb) => server.onMessage(''+epoch, ''+tag, cb),
+    receiveFrom: (epoch, tag, cb) => server.onMessageFrom(''+epoch, ''+tag, i, cb),
     allConnected: Promise.all(server.connected).then(() => undefined),
     kConnected: k => {
       const ret = defer()
