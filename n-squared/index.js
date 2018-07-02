@@ -285,10 +285,11 @@ function RWebSocketServer(port, n, skey, pkey, usernames, dhkeys) {
       const epochTag = epoch.length + ' ' + epoch + tag
       const recd = [...Array(n)].map(_ => false)
       const listener = (i, m) => {
-        if (!recd[i]) cb(i, m)
+        let termed = false
+        if (!recd[i]) termed = cb(i, m)
         
         recd[i] = true
-        return recd.every(t => t)
+        return termed || recd.every(t => t)
       }
       
       messageListeners.set(epochTag, listener)

@@ -12,16 +12,17 @@ const skLength = 32
 const pkLength = 33
 
 function point(val_) {
-  if (val_.constructor.toString().startsWith('function Buffer')) {
+  if (val_ === undefined) return undefined
+  else if (typeof val_ === 'string') {
+    return point(Buffer.from(val_.padEnd(val_.length+3-((val_.length-1)&3),'='), 'base64'))
+    
+  } else if (val_.constructor.toString().startsWith('function Buffer')) {
     if (val_.length !== pkLength || (val_[0] !== 2 && val_[0] !== 3)) return undefined
 
-    let dec
     try {
-      dec = ecc.decodePoint(val_)
-      break
+      const dec = ecc.curve.decodePoint(val_)
+      if (dec.validate()) return point(dec)
     } catch (e) { }
-    
-    return (dec && dec.validate()) ? point(dec) : undefined
 
   } else if (val_.constructor.toString().startsWith('function Point')) {
     const val = val_
@@ -49,29 +50,24 @@ function point(val_) {
         return point(val.add(P2.val.neg()))
       },
       encode:() => Buffer.from(val.encodeCompressed()),
-      encodeStr:() => Buffer.from(val.encodeCompressed()).toString('hex')
+      encodeStr:() => Buffer.from(val.encodeCompressed()).toString('base64').replace(/=/gi,'')
     }
 
   } else {
-    throw "unknown data type converted to scalar"
+    throw "unknown data type converted to point"
   }
 }
 
 function scalar(val_) {
-  if (typeof val_ === 'number') {
-    return scalar(new BN(val_).toRed(Fr)
-
-  } else if (val_.constructor.toString().startsWith('function Buffer')) {
-    if (val_.length !== skLength) return undefined
-    
-    let dec
+  if (val_ === undefined) return undefined
+  else if (typeof val_ === 'number' || val_.constructor.toString().startsWith('function Buffer')) {
     try {
-      dec = ecc.keyFromPrivate(val_).getPrivate().toRed(Fr)
-      break
+      return scalar(new BN(val_).toRed(Fr))
     } catch (e) { }
-    
-    return (dec) ? scalar(dec) : undefined
 
+  } else if (typeof val_ === 'string') {
+    return scalar(Buffer.from(val_.padEnd(val_.length+3-((val_.length-1)&3),'='), 'base64'))
+    
   } else if (val_.constructor.toString().startsWith('function BN')) {
     const val = (val_.red) ? val_.clone() : val_.toRed(Fr)
 
@@ -88,7 +84,7 @@ function scalar(val_) {
       },
       mul:P2 => {
         return (P2.isPoint) ? point (P2.val.mul(val))
-                              scalar(val.redMul(P2.val))
+                            : scalar(val.redMul(P2.val))
       },
       div:P2 => {
         if (!P2.isScalar) throw "cannot divide a scalar by a curve point!"
@@ -100,8 +96,8 @@ function scalar(val_) {
         if (!P2.isScalar) throw "cannot exponentiate a scalar to the power of a curve point!"
         return scalar(val.redPow(P2))
       },
-      encode:val.toBuffer,
-      encodeStr:() => val.toBuffer().toString('hex')
+      encode:() => val.toBuffer(),
+      encodeStr:() => val.toBuffer().toString('base64').replace(/=/gi,'')
     }
 
   } else {
@@ -114,11 +110,11 @@ function genSk() {
 }
 
 function hashToStr(m) {
-  return sha('sha256').update(m).digest('hex')
+  return sha('sha256').update(m).digest('base64')
 }
 
 function hashToBuf(m) {
-  return Buffer.from(hashToStr(m), 'hex')
+  return Buffer.from(hashToStr(m), 'base64')
 }
 
 function hashToScalar(m) {
@@ -131,11 +127,11 @@ function hashToPoint(m) {
 
   while (true) {
     let one = hashToStr(i+m)
-    buf[0] = (Buffer.from(one, 'hex')[0] % 2) ? 2 : 3
+    buf[0] = (Buffer.from(one, 'base64')[0] % 2) ? 2 : 3
     buf.set(hashToBuf(one+m), 1)
 
     try {
-      ret = ecc.decodePoint(buf)
+      ret = ecc.curve.decodePoint(buf)
       break
     } catch (e) { }
     
@@ -153,6 +149,65 @@ function mul(P1, P2, ...Pn) {
   return !P2 ? P1 : mul(P1.mul(P2), ...Pn)
 }
 
+function replaceECStuffWithStrs(obj) {
+  if (typeof obj !== 'object') {
+    return ['X', obj]
+  } else if (!obj.isPoint && !obj.isScalar) {
+    const newObj = obj
+    for (let key in obj) {
+      newObj[key] = replaceECStuffWithStrs(obj[key])
+    }
+    
+    return newObj
+  } else {
+    return (obj.isPoint) ? ['P', obj.encodeStr()] : ['S', obj.encodeStr()]
+  }
+}
+
+function encodeData(data) {
+  return JSON.stringify(replaceECStuffWithStrs(data))
+}
+
+function unreplaceECStuffWithStrs(obj, prefix, props) {
+  if (typeof obj !== 'object') {
+    throw 'parsing error'
+  } else if (obj[0] === 'X') {
+    if (obj.length === 2 && props.length === 1 && props[0][1] === 'X') return obj[1]
+  } else if (obj[0] === 'P') {
+    if (obj.length === 2 && props.length === 1 && props[0][1] === 'P') return point(obj[1])
+  } else if (obj[0] === 'S') {
+    if (obj.length === 2 && props.length === 1 && props[0][1] === 'S') return scalar(obj[1])
+  } else {
+    const newObj = obj
+    for (let key in obj) {
+      const subPrefix = (prefix === '') ? key : prefix+'.'+key
+      const subProps = props.filter(prop => prop[0].startsWith(subPrefix))
+      if (subProps.length === 0) throw 'parsing error'
+      
+      newObj[key] = unreplaceECStuffWithStrs(obj[key], subPrefix, subProps)
+      if (newObj[key] === undefined) throw 'parsing error'
+    }
+    
+    return newObj
+  }
+}
+
+function decodeData(data, props, cb) {
+  try {
+    let parsed = unreplaceECStuffWithStrs(JSON.parse(data), '', props)
+    if (props.every(prop => prop[0].split('.').reduce((child, key) => child[key], parsed))) cb(parsed)
+  } catch (e) { }
+}
+
+function concatProps(prefix, subProps) {
+  return (prefix === '') ? subProps : subProps.map(prop => [ prefix+'.'+prop[0], prop[1] ])
+}
+
+
+
+
+
+
 // ---------------------------------------------------------------
 
 const G = point(ecc.curve.g)
@@ -162,21 +217,53 @@ const G3 = hashToPoint('3')
 
 // ---------------------------------------------------------------
 
-function chaumPedersenDecode(data, cb) {
-  const [ challengeRaw, responseRaw, sigRaw ] = data.split(' ')
-  const challenge = scalar(challengeRaw),
-        response  = scalar(responseRaw),
-        sig       = point(sigRaw)
-
-  if (challenge && response && sig)
-    cb({ proof:{ challenge, response }, sig })
+function pathToLeaf(leaf, treeDepth) {
+  return [...Array(treeDepth)].map((_, i) => (leaf >> (treeDepth-1-i)) % 2)
 }
 
-function chaumPedersenEncode({ proof, sig }) {
-  return proof.challenge.encodeStr()+' '
-       + proof.response.encodeStr()+' '
-       + sig.encodeStr()
+function depth(num) {
+  let d = 0
+  while ((num-1 >> d) > 0) d++
+  
+  return d
 }
+
+function roundUpPow2(num) {
+  return (1 << depth(num))
+}
+
+function merkleConstruct_(data) {
+  const paddedData = data.concat([...Array(roundUpPow2(data.length)-data.length)].map(() => ''))
+  
+  if (data.length > 1) {
+    const lnode = merkleConstruct_(paddedData.slice(0, paddedData.length/2)),
+          rnode = merkleConstruct_(paddedData.slice(paddedData.length/2, paddedData.length))
+    
+    return [ 'N'+hashToStr(lnode[0]+' '+rnode[0]), lnode, rnode ]
+  } else return [ 'L'+hashToStr(JSON.stringify(data[0])) ]
+}
+
+function merkleBranch(tree, depth, leaf) {
+  const side = pathToLeaf(leaf, depth)[0]
+  if (depth > 0)
+    return [ ...merkleBranch(tree[1+side], depth-1, leaf - (side << (depth-1))), tree[2-side][0] ]
+  else
+    return [ ]
+}
+
+function merkleConstruct(data) {
+  const tree = merkleConstruct_(data)
+  return { root:tree[0], tree, branch:(leaf) => merkleBranch(tree, depth(data.length), leaf) }
+}
+
+function merkleBranchVerify(leaf, datum, branch, root) {
+  const pathFromLeaf = pathToLeaf(leaf, branch.length).reverse()
+  return branch.reduce((acc, sideHash, i) => 'N'+hashToStr(pathFromLeaf[i] ? (sideHash+' '+acc) : (acc+' '+sideHash)), 'L'+hashToStr(JSON.stringify(datum))) === root
+}
+
+// ---------------------------------------------------------------
+
+const chaumPedersenDecode = [['c', 'S'], ['z', 'S'], ['sig', 'P']]
 
 function chaumPedersenProve(sk, m) {
   const H = hashToPoint(m)
@@ -184,54 +271,38 @@ function chaumPedersenProve(sk, m) {
   const pubNonceG = nonce.mul(G)
   const pubNonceH = nonce.mul(H)
   
-  const challenge = hashToScalar(pubNonceG.toString('hex') + '||' + pubNonceH.toString('hex'))
-  
-  const proof = { challenge, response: nonce.sub(sk.mul(challenge)) }
-  const sig = sk.mul(H)
+  const c = hashToScalar(pubNonceG.encodeStr() + '||' + pubNonceH.encodeStr())
 
-  return { proof, sig }
+  return { c, z:nonce.sub(sk.mul(challenge)), sig:sk.mul(H) }
 }
 
-function chaumPedersenVerify(pk, m, { proof, sig }) {
+function chaumPedersenVerify(pk, m, { c, z, sig }) {
   const H = hashToPoint(m)
-  const { challenge, response } = proof
-  const pubNonceG_ = response.mul(G).add( pk.mul(challenge))
-  const pubNonceH_ = response.mul(H).add(sig.mul(challenge))
-  const challenge_ = hashToScalar(pubNonceG_.toString('hex') + '||' + pubNonceH_.toString('hex'))
+  const pubNonceG_ = z.mul(G).add( pk.mul(c))
+  const pubNonceH_ = z.mul(H).add(sig.mul(c))
+  const c_ = hashToScalar(pubNonceG_.encodeStr() + '||' + pubNonceH_.encodeStr())
   
-  return challenge.equals(challenge_)
+  return c.equals(c_)
 }
 
 // ---------------------------------------------------------------
 
-function schnorrDecode(data, cb) {
-  const [ challengeRaw, responseRaw ] = data.split(' ')
-  const challenge = scalar(challengeRaw),
-        response  = scalar(responseRaw)
-
-  if (challenge && response)
-    cb({ challenge, response })
-}
-
-function schnorrEncode({ challenge, response }) {
-  return challenge.encodeStr()+' '
-       + response.encodeStr()
-}
+const schnorrDecode = [['c', 'S'], ['z', 'S']]
 
 function schnorrSign(sk, m) {
   const nonce = genSk()
   const pubNonce = nonce.mul(G)
   
-  const challenge = hashToScalar(pubNonce.toString('hex') + '||' + m)
+  const c = hashToScalar(pubNonce.encodeStr() + m)
 
-  return { challenge, response: nonce.sub(sk.mul(challenge)) }
+  return { c, z: nonce.sub(sk.mul(c)) }
 }
 
 function schnorrVerify(pk, m, { challenge, response }) {
   const pubNonce_ = response.mul(G).add(pk.mul(challenge))
-  const challenge_ = hashToScalar(pubNonce_.toString('hex') + '||' + m)
+  const c_ = hashToScalar(pubNonce_.encodeStr() + '||' + m)
   
-  return challenge.equals(challenge_)
+  return c.equals(c_)
 }
 
 // ---------------------------------------------------------------
@@ -263,7 +334,7 @@ function interpolate(shares_, x_ = 0) {
 
 // ---------------------------------------------------------------
 
-function feldmanDeal(epoch, tag, sk, t, broker) {
+function feldmanDeal(epoch, tag, sk, broker, t) {
   t = t||(((broker.n - 1)/3|0) + 1)
 
   const { shares, coeffs } = secretShare(sk, t, broker.n)
@@ -278,7 +349,7 @@ function feldmanDeal(epoch, tag, sk, t, broker) {
   return hashToStr(commitEnc)
 }
 
-function feldmanReceive(epoch, tag, sender, t, broker) {
+function feldmanReceive(epoch, tag, sender, broker, t) {
   t = t||(((broker.n - 1)/3|0) + 1)
   const result = defer()
 
@@ -300,6 +371,8 @@ function feldmanReceive(epoch, tag, sender, t, broker) {
 
 // ---------------------------------------------------------------
 
+const pedersenZKDecode = [['mask', 'S'], ['pk', 'P'], ['c', 'S'], concatProps('sig', schnorrDecode)]
+
 function pedersenCommit(val, mask) {
   return val.mul(G).add(mask.mul(G1))
 }
@@ -313,20 +386,6 @@ function pedersenZKProve(val, mask) {
   return { mask, pk, sig:schnorrSign(val, ''), c:pk.add(mask.mul(G1)) }
 }
 
-function pedersenZKEncode({ mask, pk, sig, c }) {
-  return mask.encodeStr() + ' ' + pk.encodeStr() + ' ' + c.encodeStr() + ' ' + schnorrEncode(sig)
-}
-
-function pedersenZKDecode(data, cb) {
-  const [ maskRaw, pkRaw, cRaw, ...sigRaw ] = data.split(' ')
-  const mask = scalar(maskRaw),
-        pk = point(pkRaw),
-        c = point(cRaw)
-  if (mask && pk && c) {
-    schnorrDecode(sigRaw.join(' '), sig => cb({ mask, pk, c, sig }))
-  }
-}
-
 function pedersenZKVerify(proof) {
   return (proof.pk.add(proof.mask.mul(G1)).equals(proof.c)
        && schnorrVerify(proof.pk, '', proof.sig))
@@ -334,27 +393,10 @@ function pedersenZKVerify(proof) {
 
 // ---------------------------------------------------------------
 
-function feldmanDeal2D(epoch, tag, sk, t, broker) {
-  const k = ((broker.n - 1)/3|0) + 1
-  t = t||k
-  
-  const { shares, coeffs } = secretShare(sk, t, broker.n)
-  const { subShares, subCoeffs } = shares.map((share, i) => 
-  const skCommit = sk.mul(G)
-  const coeffCommits = coeffs.map(c => c.mul(G))
-  const commitEnc = skCommit.encodeStr()
-    +' '+coeffCommits.map(p => p.encodeStr()).join(' ')
-  
-  const mFunc = (i) => shares[i].encodeStr()+' '+commitEnc
-  broker.send(epoch, tag, mFunc)
-  
-  return hashToStr(commitEnc)
-}
-
 // TODO: add polynomial commitments for better communication complexity
-function cachinDealPH(epoch, tag, sk, t, broker) {
-  const k = ((broker.n - 1)/3|0) + 1
-  t = t||k
+function AVSSPHDeal(epoch, tag, sk, broker, reliableBroadcast, t) {
+  const f = (broker.n - 1)/3|0
+  t = t||f+1
   
   const skMask = genSk()
   const skCommit = pedersenCommit(sk, skMask)
@@ -362,7 +404,7 @@ function cachinDealPH(epoch, tag, sk, t, broker) {
   const { maskShares, maskCoeffs } = secretShare(skMask, t, broker.n)
   const coeffCommits = coeffs.map((coeff, i) => pedersenCommit(coeff, maskCoeffs[i]))
   
-  const sub = (ss) => ss.map((s, i) => secretShare(s, k, broker.n))
+  const sub = (ss) => ss.map((s, i) => secretShare(s, f+1, broker.n))
                         .reduce(({ sArrs, cArrs }, { sArr, cArr }) => {
                           sArr.forEach((s, i) => sArrs[i].push(s))
                           cArrs.push(cArr)
@@ -383,67 +425,60 @@ function cachinDealPH(epoch, tag, sk, t, broker) {
                      +'|'+subMaskShares[i].map(s => s.encodeStr()).join(' ')
   
   const mFunc = (i) => shareEnc(i)+'+'+commitEnc
-  broker.send(epoch, tag, mFunc)
+  reliableBroadcast(epoch, tag, mFunc, broker)
 
   return hashToStr(commitEnc)
 }
 
-function cachinReceivePH(epoch, tag, sender, t, broker) {
-  const k = ((broker.n - 1)/3|0) + 1
-  t = t||k
-  const result = defer(), mustRecover = defer()
+function AVSSPHReceive(epoch, tag, sender, broker, reliableReceive, t) {
+  const f = (broker.n - 1)/3|0
+  t = t||f+1
+  const result = defer(), mustRecover = defer(), shouldRecover = defer(), recoveredValue = defer()
+  let echoed = false, readied = false
   
   let share, maskShare, subShares, subMaskShares, skCommit, coeffCommits, subCoeffCommits, h
 
-  broker.receiveFrom(epoch, tag, sender, m => {
-    const [ shareStuffRaw, commitStuffRaw ] = m.split('+')
-    if (!shareStuffRaw || !commitStuffRaw) return;
+  broker.receiveFrom(epoch, tag+'i', sender, m => {
+    if (echoed) return true
+    try {
+      const [ shareStuffRaw, commitStuffRaw ] = m.split('+')
 
-    const [ shareRaw, maskShareRaw, subSharesRaw, subMaskSharesRaw ] = shareStuffRaw.split('|')
-    const [ skCommitRaw, coeffCommitsRaw, ...subCoeffCommitsRaw ] = commitStuffRaw.split('|')
-
-    if (!shareRaw || !maskShareRaw || !subSharesRaw || !subMaskSharesRaw) return;
-    if (!skCommitRaw || !coeffCommitsRaw || !subCoeffCommitsRaw) return;
-    
-    const subShareRaws = subSharesRaw.split(' ')
-    const subMaskShareRaws = subMaskSharesRaw.split(' ')
-    
-    const coeffCommitRaws = coeffCommitsRaw.split(' ')
-    const subCoeffCommitRaws = subCoeffCommitsRaw.map(astr => astr.split(' '))
-    
-    if (subShareRaws.length !== n || subMaskShareRaws.length !== n ||
-        coeffCommitRaws.length !== t || subCoeffCommitRaws.length !== n ||
-        !subCoeffCommitRaws.every(a => a.length === k)) return;
-    
-    share = scalar(shareRaw),
-    maskShare = scalar(maskShareRaw),
-    subShares = subShareRaws.map(s => scalar(s)),
-    subMaskShares = subMaskShareRaws.map(s => scalar(s)),
-    skCommit = point(skCommitRaw),
-    coeffCommits = coeffCommitRaws.map(p = > point(p)),
-    subCoeffCommits = subCoeffCommitRaws.map(a => a.map(p => point(p)))
-    
-    if (!share || !maskShare || !skCommit || 
-        !subShares.every(s => s) || !subMaskShares.every(s => s) ||
-        !coeffCommits.every(p => p) || !coeffCommits.every(a => a.every(p => p))) return;
-    
-    if (pedersenCommit(share, maskShare)
-        .equals(polyEval(skCommit, coeffCommits, broker.thisHostIndex))) {
-      const shareCommits = [...Array(broker.n)].map((_, i) => polyEval(skCommit, coeffCommits, i))
+      const [ [share], [maskShare], subShares, subMaskShares ] = shareStuffRaw.split('|').map(a => a.split(' ')).map(a => a.map(s => scalar(s)))
+      const [ [skCommit], coeffCommits, ...subCoeffCommits ] = commitStuffRaw.split('|').map(a => a.split(' ')).map(a => a.map(p => point(p)))
       
-      if (subShares.every((subShare, i) => pedersenCommit(subShare, subMaskShare[i])
-          .equals(polyEval(shareCommits[i], subCoeffCommits[i], broker.thisHostIndex)))) {
-        h = hashToStr(commitStuffRaw)
+      if (subShares.length !== n || subMaskShares.length !== n ||
+          coeffCommits.length !== t-1 || subCoeffCommits.length !== n ||
+          !subCoeffCommits.every(a => a.length === f)) return;
+      
+      if (!share || !maskShare || !skCommit || 
+          !subShares.every(s => s) || !subMaskShares.every(s => s) ||
+          !coeffCommits.every(p => p) || !coeffCommits.every(a => a.every(p => p))) return;
+      
+      if (pedersenCommit(share, maskShare)
+          .equals(polyEval(skCommit, coeffCommits, broker.thisHostIndex))) {
+        // TODO: investigate if this can be made faster by multiplying by a random polynomial and checking
+        // for a few nonzero coeffs
+        const shareCommits = [...Array(broker.n)].map((_, i) => polyEval(skCommit, coeffCommits, i))
         
-        broker.broadcast(epoch, tag+'e', h)
-        mustRecover.then(([ h_, unrecoveredNodes ]) => {
-          if (h !== h_) return;
+        if (subShares.every((subShare, i) => pedersenCommit(subShare, subMaskShare[i])
+            .equals(polyEval(shareCommits[i], subCoeffCommits[i], broker.thisHostIndex)))) {
+          h = hashToStr(commitStuffRaw)
           
-          unrecoveredNodes.forEach(j => 
-            broker.sendTo(epoch, tag+'u', j, subShareRaws[j]+' '+subMaskShareRaws[j]+
-                                             subCoeffCommits[j].join(' ')))
+          broker.broadcast(epoch, tag+'e', h)
+          echoed = true
+          mustRecover.then(([ h_, unrecoveredNodes ]) => {
+            if (h !== h_) return;
+            
+            unrecoveredNodes.forEach(j => 
+              broker.sendTo(epoch, tag+'u', j, subShareRaws[j]+'|'+subMaskShareRaws[j]+'|'+skCommitRaw+'|'
+                                               shareCommits.map(c => c.encodeStr()).join(' ')+'|'+subCoeffCommitsRaw[j]))
+          }
+          
+          recoveredValue.resolve({ share, maskShare, skCommit, shareCommits })
         }
       }
+    } catch (e) {
+    
     }
   })
   
@@ -451,51 +486,64 @@ function cachinReceivePH(epoch, tag, sender, t, broker) {
   broker.receive(epoch, tag+'e', (i, h_) => {
     hashes[i] = h_
     let matching = hashes.filter(h__ => h__ === h_)
-    if (matching.length >= n-k) {
+    if (matching.length >= n-f) {
       mustRecover.resolve([ h_, [...Array(broker.n)].map((_,i) => i).filter(i => !hashes[i]) ])
-      broker.broadcast(epoch, tag+'r', h_)
+      if (!readied) broker.broadcast(epoch, tag+'r', h_)
+      readied = true
       
       return true
     }
   })
   
+  const rhashes = [...Array(broker.n)]
   broker.receive(epoch, tag+'r', (i, h_) => {
-    
+    hashes[i] = h_
+    let matching = hashes.filter(h__ => h__ === h_)
+    if (matching.length >= f+1 && !readied) {
+      broker.broadcast(epoch, tag+'r', h_)
+      readied = true
+    }
+    if (matching.length >= n-f) {
+      shouldRecover.resolve()
+      result.resolve(recoveredValue)
+      
+      return true
+    }
   })
   
+  const recoveryData = [...Array(broker.n)]
   broker.receive(epoch, tag+'u', (i, data) => {
     if (recovered) return true
-  })
-}
-
-// ---------------------------------------------------------------
-
-function AVSSDeal(epoch, tag, secret, broker) {
-  const t = ((broker.n - 1)/3|0) + 1
-  
-  cachinDealIS(epoch, tag+'b', secret, t, broker)
-}
-
-function AVSSReceive(epoch, tag, sender, broker) {
-  const t = ((broker.n - 1)/3|0) + 1
-  const result = defer()
-  let receivedShare = undefined
-  
-  const receivedEchoes = [...new Array(broker.n)]
-  feldmanReceive(epoch, tag+'b', sender, t, broker, receivedShare_ => {
-    receivedShare = receivedShare_
-    broker.broadcast(epoch, tag+'e', receivedShare.h)
+    const [ subShareRaw, subMaskShareRaw, skCommitRaw, shareCommitsRaw, subCoeffCommitsRaw ] = data.split('|')
+    const shareCommitRaws = shareCommitsRaw.split(' '),
+          subCoeffCommitRaws = subCoeffCommitsRaw.split(' ')
+    if (subCoeffCommitRaws.length !== f || shareCommitRaws.length !== n) return;
     
-    if (receivedEchoes.filter(h => h === m).length >= n-t)
-      result.resolve(receivedShare)
+    const subShare = scalar(subShareRaw),
+          subMaskShare = scalar(subMaskShareRaw),
+          skCommit = point(skCommitRaw),
+          shareCommits = shareCommitRaws.map(c => point(c)),
+          subCoeffCommits = subCoeffCommitRaws.map(c => point(c))
+    
+    if (subShare && subMaskShare && skCommit && shareCommits.every(p => p) && subCoeffCommits.every(p => p)) {
+      const c_ = hashToStr(skCommitRaw + '|' + shareCommitsRaw + '|' + subCoeffCommitsRaw)
+      recoveryData[i] = { subShare, subMaskShare, c_, tested:false }
+      
+      shouldRecover.then(() => {
+        if (recovered) return;
+        if (!pedersenCommit(subShare, subMaskShare).equals(polyEval(shareCommits[broker.thisHostIndex], subCoeffCommits, i))) return;
+        recoveryData[i].tested = true
+        
+        let matching = recoveryData.filter(dat => (dat.tested && dat.c_ === c_))
+        if (matching.length >= f+1) {
+          recoveredValue.resolve({ share, maskShare, skCommit, shareCommits })
+          recovered = true
+        }
+      }
+    }
   })
   
-  broker.receive(epoch, tag+'e', (i, m) => {
-    receivedEchoes[i] = m
-    
-    if (receivedShare && receivedEchoes.filter(h => h === receivedShare.h).length >= n-t)
-      result.resolve(receivedShare)
-  })
+  return result
 }
 
 // ---------------------------------------------------------------
@@ -504,7 +552,7 @@ function AVSSReceive(epoch, tag, sender, broker) {
 // using Boldyreva threshold signatures, but rather than verifying the
 // shares using a pairing we instead use a Chaum-Pedersen NIZK to prove
 // equality of discrete logs. Note this precludes aggregate verification.
-function commonCoin(epoch, tag, sk, pks, t, broker) {
+function commonCoin(epoch, tag, sk, pks, broker, t) {
   t = t||(((broker.n - 1)/3|0) + 1)
   const result = defer()
 
@@ -534,21 +582,28 @@ function commonCoin(epoch, tag, sk, pks, t, broker) {
 //     the (i, j) secret to be F(s[i], j), where F is a key-homomorphic prf.
 //   - Most of the protocol is done only once to derive the shared secrets; after
 //     that we use F to derive the partially shared random values for each coin flip.
-function setupHeavyCommonCoin(epoch, tag, broker) {
+function setupHeavyCommonCoin(epoch, tag, broker, reliableBroadcast, reliableReceive) {
+  const f = (broker.n - 1)/3|0
   const id = epoch.length+' '+epoch+tag
   const result = defer()
 
   // Each node deals a secret
   const r = genSk()
-  dealCAVSS(epoch, tag+'a'+broker.thisHostIndex, r, broker)
+  AVSSPHDeal(epoch, tag+'a'+broker.thisHostIndex, r, broker, reliableBroadcast)
   
   const avss_instances = [...Array(broker.n)].map((_, i) => 
-    receiveCAVSS(epoch, tag+'a'+i, i, broker))
+    AVSSPHReceive(epoch, tag+'a'+i, i, broker, reliableReceive))
   
   const receivedShares = [...Array(broker.n)]
-  let C = [ ], G = [ ]
-  avss_instances.map((p, i) => p.then(share => {
-    
+  const C = [ ], G = [ ]
+  let accepted = false
+  avss_instances.map((p, i) => p.then(shareAndCommits => {
+    C.push(i)
+    receivedShares[i] = shareAndCommits
+    if (!accepted && C.length >= f+1) {
+      reliableBroadcast(epoch, tag+'c', JSON.stringify(C), broker)
+      accepted = true
+    }
   }))
 }
 
