@@ -533,8 +533,8 @@ function commonCoin(epoch, tag, sk, pks, broker, t) {
   })
 }
 
-// Slightly modified version of Canetti's common coin that doesn't use
-// threshold cryptography. Modifications are:
+// Modified version of Canetti's threshold-cryptography-free common coin.
+// Modifications are:
 //   - Uses consistent AVSS instead of full AVSS since we're in the computational
 //     setting where we can verify shares.
 //   - Instead of sharing n^2 secrets, we just share s[1],..,s[n] and take
@@ -544,6 +544,11 @@ function commonCoin(epoch, tag, sk, pks, broker, t) {
 //   - A tighter analysis of the overlap of the Z sets reveals that |M|>n/2, so I
 //     increased u to n+1 which makes the coin common-random more often.
 //     Specifically, Pr[c=1 for all nodes], Pr[c=0 for all nodes] >= 0.36 for n>=4.
+//     Credit to Alex Ravsky: https://math.stackexchange.com/a/2442870/207264
+//   - Adds a little bit of extra communication at the end to make it so that if
+//     any node terminates setup with the support set Z, then Z is contained in G.
+//     This allows us to lock G in place so that even if we later add a node to G,
+//     we won't need to reconstruct the share corresponding to this node.
 function setupHeavyCommonCoin(epoch, tag, broker, reliableBroadcast, reliableReceive) {
   const n = broker.n, f = (n - 1)/3|0
   const id = epoch.length+' '+epoch+tag
@@ -557,17 +562,43 @@ function setupHeavyCommonCoin(epoch, tag, broker, reliableBroadcast, reliableRec
     AVSSPHReceive(epoch, tag+'a'+i, i, broker, reliableReceive))
   
   const receivedShares = arrayOf(n), receivedAttaches = arrayOf(n),
-        pendingAttaches = arrayOf(n, () => [ ]), pendingReadies = arrayOf(n, () => [ ])
+        pendingAttaches = arrayOf(n, () => [ ]), pendingAttachesFinalized = arrayOf(n, () => [ ]),
+        pendingReadies = arrayOf(n, () => [ ]), pendingReadiesFinalized = arrayOf(n, () => [ ]),
+        pendingOuters = arrayOf(n, () => [ ])
+        
   const C = [ ], G = [ ]
   
-  let accepted = false
+  let accepted = false, readied = false
+  
+  
+  
+  function updateAttaches() { pendingAttaches.forEach(([A, Ap]) => {
+    if (A && A.every(j => C.includes(j)))
+      Ap.resolve(JSON.stringify(A))
+  }) }
+  
+  function updateAttachesFinalized() { pendingAttachesFinalized.forEach(([A, Ap]) => {
+    if (A && A.every(j => C.includes(j)))
+      Ap.resolve()
+  }) }
+  
+  function updateReadies() { pendingReadies.forEach(([B, Bp]) => {
+    if (B && B.every(j => G.includes(j)))
+      Bp.resolve(JSON.stringify(B))
+  }) }
+  
+  function updateOuters() { pendingOuters.forEach(([O, Op]) => {
+    if (O && O.every(j => G.includes(j)) &&
+        pendingReadiesFinalized.filter(B => B.every(j => O.includes(j))).length >= n-f)
+      Op.resolve(JSON.stringify(O))
+  }) }
+  
+  
+  
   avss_instances.forEach((p, i) => p.then(shareAndCommits => {
     C.push(i)
-    pendingAttaches.filter(([A, Ap]) => {
-      if (A && A.every(j => C.includes(j))) {
-        Ap.resolve(JSON.stringify(A))
-      }
-    })
+    updateAttaches()
+    updateAttachesFinalized()
     
     receivedShares[i] = shareAndCommits
     if (!accepted && C.length >= f+1) {
@@ -583,57 +614,81 @@ function setupHeavyCommonCoin(epoch, tag, broker, reliableBroadcast, reliableRec
         let A = [...(new Set(JSON.parse(m))).values()]
         if (A.length >= f+1) {
           pendingAttaches[i] = [A, ret]
-          if (A.every(j => C.includes(j))) {
-            ret.resolve(JSON.stringify(A))
-          }
+          updateAttaches()
         }
       } catch (e) { }
     }))
   
-  let readied = false
   attaches.forEach((p, i) => p.then(Araw => {
     const A = JSON.parse(Araw)
-    if (!pendingAttaches[i][0]) pendingAttaches[i] = [A, defer()]
-    if (A.every(j => C.includes(j))) {
-      pendingAttaches[i][1].resolve(A)
-    }
+    pendingAttachesFinalized[i] = [A, defer()]
+    updateAttachesFinalized()
     
-    pendingAttaches[i][1].then(() => {
+    pendingAttachesFinalized[i][1].then(() => {
       G.push(i)
-      pendingReadies = pendingReadies.filter(([B, Bp]) => {
-        if (B.every(j => G.includes(j))) {
-          Bp.resolve(JSON.stringify(B))
-          return false
-        } else
-          return true
-      })
+      updateReadies()
+      updateOuters()
       
-      receivedShares[i] = JSON.parse(Araw)
       if (!readied && G.length >= n-f) {
         reliableBroadcast(epoch, tag+'g'+broker.thisHostIndex, JSON.stringify(G), broker)
-        accepted = true
+        readied = true
       }
     })
   }))
   
   const readies = arrayOf(n, i =>
     reliableReceive(epoch, tag+'g'+i, i, broker, (m, ret) => {
+      if (pendingReadies[i][0]) return;
       try {
         let B = [...(new Set(JSON.parse(m))).values()]
-        if (B.length >= f+1) {
-          if (B.every(j => G.includes(j))) {
-            ret.resolve(JSON.stringify(B))
-          } else {
-            pendingReadies.push([B, ret])
-          }
+        if (B.length >= n-f) {
+          pendingReadies[i] = [B, ret]
+          updateReadies()
         }
       } catch (e) { }
     }))
   
-  let count = 0
-  readies.forEach((p, i) => p.then(() => {
-    count++
-    if (count >=
+  let countG = 0, outerd = false
+  readies.forEach((p, i) => p.then(Braw => {
+    const B = JSON.parse(Braw)
+    
+    pendingReadiesFinalized[i] = B
+    updateOuters()
+    
+    countG++
+    if (!Zd && countG >= n-f) {
+      reliableBroadcast(epoch, tag+'o'+broker.thisHostIndex, JSON.stringify(G), broker)
+      outerd = true
+    }
+  })
+  
+  const outers = arrayOf(n, i =>
+    reliableReceive(epoch, tag+'o'+i, i, broker, (m, ret) => {
+      if (pendingOuters[i][0]) return;
+      try {
+        let O = [...(new Set(JSON.parse(m))).values()]
+        if (O.length >= n-f) {
+          pendingOuters[i] = [O, ret]
+          updateOuters()
+        }
+      } catch (e) { }
+    })
+  
+  let acceptedOuters = [ ]
+  outers.forEach((p, i) => p.then(Oraw => {
+    const O = JSON.parse(Oraw)
+    acceptedOuters.push(O)
+    
+    if (countO >= n-f) {
+      result.resolve([ acceptedOuters.reduce((acc, Oset) => acc.filter(j => Oset.includes(j))),
+                       acceptedOuters.reduce((acc, Oset) => [...new Set([...acc, ...Oset])]) ])
+    }
+  }))
+  
+  return result.then(([ finalZ, finalG ]) => {
+    return {
+      coin:
+    }
   })
 }
 

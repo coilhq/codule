@@ -60,7 +60,7 @@ function brachaBroadcast(epoch, tag, m, broker) {
     broker.send(epoch, tag+'i', m)
 }
 
-function brachaReceive(epoch, tag, sender, broker, parseInput = m => Promise.resolve(m), didntEcho) {
+function brachaReceive(epoch, tag, sender, broker, parseInput = (m, ret) => ret.resolve(m), didntEcho) {
   const f = (broker.n-1)/3|0, n = broker.n
   const result = defer()
   
@@ -68,7 +68,10 @@ function brachaReceive(epoch, tag, sender, broker, parseInput = m => Promise.res
   let echoesReceived;
   
   broker.receiveFrom(epoch, tag+'i', sender, m => {
-    parseInput(m, defer()).then(pm => {
+    let parsed = defer()
+    parseInput(m, parsed)
+    
+    parsed.then(pm => {
       if (!echoed && pm) {
         broker.broadcast(epoch, tag+'e', pm)
         echoed = true
