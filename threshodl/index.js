@@ -185,7 +185,7 @@ function unreplaceECStuffWithStrs(obj, prefix, props) {
       if (subProps.length === 0) throw 'parsing error'
       
       newObj[key] = unreplaceECStuffWithStrs(obj[key], subPrefix, subProps)
-      if (newObj[key] === undefined) throw 'parsing error'
+      if (newObj[key] === undefined || newObj[k) throw 'parsing error'
     }
     
     return newObj
@@ -203,10 +203,11 @@ function concatProps(prefix, subProps) {
   return (prefix === '') ? subProps : subProps.map(prop => [ prefix+'.'+prop[0], prop[1] ])
 }
 
+// ---------------------------------------------------------------
 
-
-
-
+function arrayOf(n, cb = () => undefined) {
+  return [...Array(n)].map((_, i) => cb(i))
+}
 
 // ---------------------------------------------------------------
 
@@ -218,7 +219,7 @@ const G3 = hashToPoint('3')
 // ---------------------------------------------------------------
 
 function pathToLeaf(leaf, treeDepth) {
-  return [...Array(treeDepth)].map((_, i) => (leaf >> (treeDepth-1-i)) % 2)
+  return arrayOf(treeDepth, i => (leaf >> (treeDepth-1-i)) % 2)
 }
 
 function depth(num) {
@@ -233,7 +234,7 @@ function roundUpPow2(num) {
 }
 
 function merkleConstruct_(data) {
-  const paddedData = data.concat([...Array(roundUpPow2(data.length)-data.length)].map(() => ''))
+  const paddedData = data.concat(arrayOf(roundUpPow2(data.length)-data.length, () => ''))
   
   if (data.length > 1) {
     const lnode = merkleConstruct_(paddedData.slice(0, paddedData.length/2)),
@@ -311,9 +312,13 @@ function polyEval(constTerm, coeffs, evalPoint) {
   return add(constTerm, ...coeffs.map((c, j) => c.mul(evalPoint.toThe(j))))
 }
 
+function polyEvalPlayer(constTerm, coeffs) {
+  return i => polyEval(constTerm, coeffs, i+1)
+}
+
 function secretShare(sk, t, n) {
-  const coeffs = [...Array(t-1)].map((_, i) => genSk())
-  const shares = [...Array(n)].map((_, i) => polyEval(sk, coeffs, i+1))
+  const coeffs = arrayOf(t-1, genSk)
+  const shares = arrayOf(n, polyEvalPlayer(sk, coeffs))
   return { shares, coeffs }
 }
 
@@ -361,7 +366,7 @@ function feldmanReceive(epoch, tag, sender, broker, t) {
     
     if (share && skCommit && coeffCommits.every(p => p)) {
       if (share.mul(G).equals(polyEval(skCommit, coeffCommits, broker.thisHostIndex))) {
-        const pks = [...Array(broker.n)].map((_, i) => polyEval(skCommit, coeffCommits, i))
+        const pks = arrayOf(broker.n, i => polyEval(skCommit, coeffCommits, i))
         
         result.resolve({ share, pks, pk:skCommit, h:hashToStr(m.split(' ').slice(1).join(' ')) })
       }
@@ -395,152 +400,106 @@ function pedersenZKVerify(proof) {
 
 // TODO: add polynomial commitments for better communication complexity
 function AVSSPHDeal(epoch, tag, sk, broker, reliableBroadcast, t) {
-  const f = (broker.n - 1)/3|0
+  const n = broker.n, f = (n - 1)/3|0
   t = t||f+1
   
   const skMask = genSk()
   const skCommit = pedersenCommit(sk, skMask)
-  const { shares, coeffs } = secretShare(sk, t, broker.n)
-  const { maskShares, maskCoeffs } = secretShare(skMask, t, broker.n)
+  const { shares, coeffs } = secretShare(sk, t, n)
+  const { maskShares, maskCoeffs } = secretShare(skMask, t, n)
   const coeffCommits = coeffs.map((coeff, i) => pedersenCommit(coeff, maskCoeffs[i]))
   
-  const sub = (ss) => ss.map((s, i) => secretShare(s, f+1, broker.n))
+  const sub = (ss) => ss.map((s, i) => secretShare(s, f+1, n))
                         .reduce(({ sArrs, cArrs }, { sArr, cArr }) => {
                           sArr.forEach((s, i) => sArrs[i].push(s))
                           cArrs.push(cArr)
-                        }, { [...Array(broker.n)].map(_ => [ ]), [ ] })
+                        }, { arrayOf(n, () => [ ]), [ ] })
+  
   // subShares[i][j] = p_j(i) where p_j is a degree (k-1) polynomial with p_j(0) = shares[j]
-  // subCoeffs[i][j] = c_ij s.t. p_i = shares[i] + c_i1*x + ... + c_i(k-1)*x^(k-1)
+  // subCoeffs[i][j] = c_ij s.t. p_i = shares[i] + c_i1*x + ... + c_i(k-1)*x^f
   const { subShares, subCoeffs } = sub(shares)
   const { subMaskShares, subMaskCoeffs } = sub(maskShares)
   const subCoeffCommits = subCoeffs.map((arr, i) => arr.map((coeff, j) => 
                             pedersenCommit(coeff, subMaskCoeffs[i][j])))
-  
-  const commitEnc = skCommit.encodeStr()
-    +'|'+coeffCommits.map(p => p.encodeStr()).join(' ')
-    +'|'+subCoeffCommits.map(pA => pA.map(p => p.encodeStr()).join(' ')).join('|')
 
-  const shareEnc = (i) => shares[i].encodeStr()+'|'+maskShares[i].encodeStr()
-                     +'|'+subShares[i].map(s => s.encodeStr()).join(' ')
-                     +'|'+subMaskShares[i].map(s => s.encodeStr()).join(' ')
-  
-  const mFunc = (i) => shareEnc(i)+'+'+commitEnc
+  const mFunc = i => encodeData([ shares[i], maskShares[i], subShares[i], subMaskShares[i],
+                                  skCommit, coeffCommits, subCoeffCommits ])
   reliableBroadcast(epoch, tag, mFunc, broker)
 
   return hashToStr(commitEnc)
 }
 
 function AVSSPHReceive(epoch, tag, sender, broker, reliableReceive, t) {
-  const f = (broker.n - 1)/3|0
+  const n = broker.n, f = (n - 1)/3|0
   t = t||f+1
-  const result = defer(), mustRecover = defer(), shouldRecover = defer(), recoveredValue = defer()
+  const result = defer(), didntEcho = defer(), shouldRecover = defer(), recoveredValue = defer()
   let echoed = false, readied = false
   
   let share, maskShare, subShares, subMaskShares, skCommit, coeffCommits, subCoeffCommits, h
 
-  broker.receiveFrom(epoch, tag+'i', sender, m => {
+  reliableReceive(epoch, tag+'i', sender, broker, (m, ret) => {
     if (echoed) return true
-    try {
-      const [ shareStuffRaw, commitStuffRaw ] = m.split('+')
-
-      const [ [share], [maskShare], subShares, subMaskShares ] = shareStuffRaw.split('|').map(a => a.split(' ')).map(a => a.map(s => scalar(s)))
-      const [ [skCommit], coeffCommits, ...subCoeffCommits ] = commitStuffRaw.split('|').map(a => a.split(' ')).map(a => a.map(p => point(p)))
-      
-      if (subShares.length !== n || subMaskShares.length !== n ||
-          coeffCommits.length !== t-1 || subCoeffCommits.length !== n ||
-          !subCoeffCommits.every(a => a.length === f)) return;
-      
-      if (!share || !maskShare || !skCommit || 
-          !subShares.every(s => s) || !subMaskShares.every(s => s) ||
-          !coeffCommits.every(p => p) || !coeffCommits.every(a => a.every(p => p))) return;
-      
+    
+    decodeData(m, [['0', 'S'], ['1', 'S'], ['4', 'P'],
+                   ...arrayOf(n, i => ['2.'+i, 'S']),
+                   ...arrayOf(n, i => ['3.'+i, 'S']),
+                   ...arrayOf(t-1, i => ['5.'+i, 'P']),
+                   ...(...arrayOf(n, i => arrayOf(f, j => ['6.'+i+'.'+j, 'P'])))], 
+    ([ share, maskShare, subShares, subMaskShares, skCommit, coeffCommits, subCoeffCommits ]) => {
       if (pedersenCommit(share, maskShare)
-          .equals(polyEval(skCommit, coeffCommits, broker.thisHostIndex))) {
-        // TODO: investigate if this can be made faster by multiplying by a random polynomial and checking
-        // for a few nonzero coeffs
-        const shareCommits = [...Array(broker.n)].map((_, i) => polyEval(skCommit, coeffCommits, i))
+          .equals(polyEvalPlayer(skCommit, coeffCommits)(broker.thisHostIndex))) {
+        const shareCommits = arrayOf(n, polyEvalPlayer(skCommit, coeffCommits))
         
         if (subShares.every((subShare, i) => pedersenCommit(subShare, subMaskShare[i])
-            .equals(polyEval(shareCommits[i], subCoeffCommits[i], broker.thisHostIndex)))) {
-          h = hashToStr(commitStuffRaw)
+            .equals(polyEvalPlayer(shareCommits[i], subCoeffCommits[i])(broker.thisHostIndex)))) {
+          h = hashToStr(encodeData([skCommit, coeffCommits, subCoeffCommits]))
           
-          broker.broadcast(epoch, tag+'e', h)
+          ret.resolve(h)
           echoed = true
-          mustRecover.then(([ h_, unrecoveredNodes ]) => {
+          
+          didntEcho.then(([ h_, unrecoveredNodes ]) => {
             if (h !== h_) return;
-            
-            unrecoveredNodes.forEach(j => 
-              broker.sendTo(epoch, tag+'u', j, subShareRaws[j]+'|'+subMaskShareRaws[j]+'|'+skCommitRaw+'|'
-                                               shareCommits.map(c => c.encodeStr()).join(' ')+'|'+subCoeffCommitsRaw[j]))
-          }
+            unrecoveredNodes.forEach(j => broker.sendTo(epoch, tag+'u', j, 
+                                encodeData([ subShares[j], subMaskShares[j], skCommit,
+                                             shareCommits, subCoeffCommits[j] ])))
+          })
           
           recoveredValue.resolve({ share, maskShare, skCommit, shareCommits })
         }
       }
-    } catch (e) {
-    
-    }
+    })
+  }, didntEcho)
+  .then(() => {
+    shouldRecover.resolve()
+    result.resolve(recoveredValue)
   })
   
-  const hashes = [...Array(broker.n)]
-  broker.receive(epoch, tag+'e', (i, h_) => {
-    hashes[i] = h_
-    let matching = hashes.filter(h__ => h__ === h_)
-    if (matching.length >= n-f) {
-      mustRecover.resolve([ h_, [...Array(broker.n)].map((_,i) => i).filter(i => !hashes[i]) ])
-      if (!readied) broker.broadcast(epoch, tag+'r', h_)
-      readied = true
-      
-      return true
-    }
-  })
-  
-  const rhashes = [...Array(broker.n)]
-  broker.receive(epoch, tag+'r', (i, h_) => {
-    hashes[i] = h_
-    let matching = hashes.filter(h__ => h__ === h_)
-    if (matching.length >= f+1 && !readied) {
-      broker.broadcast(epoch, tag+'r', h_)
-      readied = true
-    }
-    if (matching.length >= n-f) {
-      shouldRecover.resolve()
-      result.resolve(recoveredValue)
-      
-      return true
-    }
-  })
-  
-  const recoveryData = [...Array(broker.n)]
+  const recoveryData = arrayof(n)
   broker.receive(epoch, tag+'u', (i, data) => {
     if (recovered) return true
-    const [ subShareRaw, subMaskShareRaw, skCommitRaw, shareCommitsRaw, subCoeffCommitsRaw ] = data.split('|')
-    const shareCommitRaws = shareCommitsRaw.split(' '),
-          subCoeffCommitRaws = subCoeffCommitsRaw.split(' ')
-    if (subCoeffCommitRaws.length !== f || shareCommitRaws.length !== n) return;
     
-    const subShare = scalar(subShareRaw),
-          subMaskShare = scalar(subMaskShareRaw),
-          skCommit = point(skCommitRaw),
-          shareCommits = shareCommitRaws.map(c => point(c)),
-          subCoeffCommits = subCoeffCommitRaws.map(c => point(c))
-    
-    if (subShare && subMaskShare && skCommit && shareCommits.every(p => p) && subCoeffCommits.every(p => p)) {
-      const c_ = hashToStr(skCommitRaw + '|' + shareCommitsRaw + '|' + subCoeffCommitsRaw)
+    decodeData(data, [['0', 'S'], ['1', 'S'], ['2', 'P'],
+                       ...arrayOf(n, i => ['3.'+i, 'P']),
+                       ...arrayOf(f, i => ['5.'+i, 'P'])],
+    ([ subShare, subMaskShare, skCommit, shareCommits, subCoeffCommits ]) => {
+      const c_ = hashToStr(encodeData([skCommit, coeffCommits, subCoeffCommits]))
       recoveryData[i] = { subShare, subMaskShare, c_, tested:false }
       
       shouldRecover.then(() => {
         if (recovered) return;
-        if (!pedersenCommit(subShare, subMaskShare).equals(polyEval(shareCommits[broker.thisHostIndex], subCoeffCommits, i))) return;
-        recoveryData[i].tested = true
         
-        let matching = recoveryData.filter(dat => (dat.tested && dat.c_ === c_))
-        if (matching.length >= f+1) {
-          recoveredValue.resolve({ share, maskShare, skCommit, shareCommits })
-          recovered = true
+        if (pedersenCommit(subShare, subMaskShare)
+            .equals(polyEvalPlayer(shareCommits[broker.thisHostIndex], subCoeffCommits)(i))) {
+          recoveryData[i].tested = true
+          
+          let matching = recoveryData.filter(dat => (dat.tested && dat.c_ === c_))
+          if (matching.length >= f+1) {
+            recoveredValue.resolve({ share, maskShare, skCommit, shareCommits })
+            recovered = true
+          }
         }
-      }
-    }
+      })
+    })
   })
   
   return result
@@ -582,8 +541,11 @@ function commonCoin(epoch, tag, sk, pks, broker, t) {
 //     the (i, j) secret to be F(s[i], j), where F is a key-homomorphic prf.
 //   - Most of the protocol is done only once to derive the shared secrets; after
 //     that we use F to derive the partially shared random values for each coin flip.
+//   - A tighter analysis of the overlap of the Z sets reveals that |M|>n/2, so I
+//     increased u to n+1 which makes the coin common-random more often.
+//     Specifically, Pr[c=1 for all nodes], Pr[c=0 for all nodes] >= 0.36 for n>=4.
 function setupHeavyCommonCoin(epoch, tag, broker, reliableBroadcast, reliableReceive) {
-  const f = (broker.n - 1)/3|0
+  const n = broker.n, f = (n - 1)/3|0
   const id = epoch.length+' '+epoch+tag
   const result = defer()
 
@@ -591,20 +553,88 @@ function setupHeavyCommonCoin(epoch, tag, broker, reliableBroadcast, reliableRec
   const r = genSk()
   AVSSPHDeal(epoch, tag+'a'+broker.thisHostIndex, r, broker, reliableBroadcast)
   
-  const avss_instances = [...Array(broker.n)].map((_, i) => 
+  const avss_instances = arrayOf(n, i => 
     AVSSPHReceive(epoch, tag+'a'+i, i, broker, reliableReceive))
   
-  const receivedShares = [...Array(broker.n)]
+  const receivedShares = arrayOf(n), receivedAttaches = arrayOf(n),
+        pendingAttaches = arrayOf(n, () => [ ]), pendingReadies = arrayOf(n, () => [ ])
   const C = [ ], G = [ ]
+  
   let accepted = false
-  avss_instances.map((p, i) => p.then(shareAndCommits => {
+  avss_instances.forEach((p, i) => p.then(shareAndCommits => {
     C.push(i)
+    pendingAttaches.filter(([A, Ap]) => {
+      if (A && A.every(j => C.includes(j))) {
+        Ap.resolve(JSON.stringify(A))
+      }
+    })
+    
     receivedShares[i] = shareAndCommits
     if (!accepted && C.length >= f+1) {
-      reliableBroadcast(epoch, tag+'c', JSON.stringify(C), broker)
+      reliableBroadcast(epoch, tag+'c'+broker.thisHostIndex, JSON.stringify(C), broker)
       accepted = true
     }
   }))
+  
+  const attaches = arrayOf(n, i =>
+    reliableReceive(epoch, tag+'c'+i, i, broker, (m, ret) => {
+      if (pendingAttaches[i][0]) return;
+      try {
+        let A = [...(new Set(JSON.parse(m))).values()]
+        if (A.length >= f+1) {
+          pendingAttaches[i] = [A, ret]
+          if (A.every(j => C.includes(j))) {
+            ret.resolve(JSON.stringify(A))
+          }
+        }
+      } catch (e) { }
+    }))
+  
+  let readied = false
+  attaches.forEach((p, i) => p.then(Araw => {
+    const A = JSON.parse(Araw)
+    if (!pendingAttaches[i][0]) pendingAttaches[i] = [A, defer()]
+    if (A.every(j => C.includes(j))) {
+      pendingAttaches[i][1].resolve(A)
+    }
+    
+    pendingAttaches[i][1].then(() => {
+      G.push(i)
+      pendingReadies = pendingReadies.filter(([B, Bp]) => {
+        if (B.every(j => G.includes(j))) {
+          Bp.resolve(JSON.stringify(B))
+          return false
+        } else
+          return true
+      })
+      
+      receivedShares[i] = JSON.parse(Araw)
+      if (!readied && G.length >= n-f) {
+        reliableBroadcast(epoch, tag+'g'+broker.thisHostIndex, JSON.stringify(G), broker)
+        accepted = true
+      }
+    })
+  }))
+  
+  const readies = arrayOf(n, i =>
+    reliableReceive(epoch, tag+'g'+i, i, broker, (m, ret) => {
+      try {
+        let B = [...(new Set(JSON.parse(m))).values()]
+        if (B.length >= f+1) {
+          if (B.every(j => G.includes(j))) {
+            ret.resolve(JSON.stringify(B))
+          } else {
+            pendingReadies.push([B, ret])
+          }
+        }
+      } catch (e) { }
+    }))
+  
+  let count = 0
+  readies.forEach((p, i) => p.then(() => {
+    count++
+    if (count >=
+  })
 }
 
 function keyGenSync(epoch, tag, t, broker) {
