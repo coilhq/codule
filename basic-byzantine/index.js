@@ -2,6 +2,12 @@
 
 // ---------------------------------------------------------------
 
+function defer() {
+  let resolve, reject
+  const promise = new Promise((res, rej) => { resolve = res; reject = rej })
+  return { resolve, reject, promise, then:() => promise.then() }
+}
+
 function receive(epoch, tag, broker, parse = (i, m) => m, st = () => Promise.resolve(true), oc = [], on = []) {
   return {
     parseInput: cb => {
@@ -29,7 +35,7 @@ function receive(epoch, tag, broker, parse = (i, m) => m, st = () => Promise.res
       return receive(epoch, tag, broker, parse, st, oc, (on||[]).concat([cb]))
     },
     digest:() => {
-      const received = [...Array(n)]
+      const received = [...Array(broker.n)]
       let count = 0
       
       broker.receive(epoch, tag, (i, m) => {
@@ -45,7 +51,7 @@ function receive(epoch, tag, broker, parse = (i, m) => m, st = () => Promise.res
             
             countedCBs.forEach(([_, cb]) => cb(received))
           }
-        }
+        })
       })
     }
   }
@@ -67,6 +73,7 @@ function brachaReceive(epoch, tag, sender, broker, parseInput = (m, ret) => ret.
   let echoed = false, readied = false
   let echoesReceived;
   
+  console.log('HEEEEEEEEEYYYYY ' + tag+'i')
   broker.receiveFrom(epoch, tag+'i', sender, m => {
     let parsed = defer()
     parseInput(m, parsed)
@@ -76,7 +83,7 @@ function brachaReceive(epoch, tag, sender, broker, parseInput = (m, ret) => ret.
         broker.broadcast(epoch, tag+'e', pm)
         echoed = true
       }
-    }
+    })
   })
   
   receive(epoch, tag+'e', broker)
@@ -100,5 +107,10 @@ function brachaReceive(epoch, tag, sender, broker, parseInput = (m, ret) => ret.
       result.resolve(m)
     }).digest()
   
-  return result
+  return result.promise
+}
+
+module.exports = {
+  brachaBroadcast,
+  brachaReceive
 }

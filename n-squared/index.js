@@ -22,7 +22,7 @@ function dehex(hexstr) {
 function defer() {
   let resolve, reject
   const promise = new Promise((res, rej) => { resolve = res; reject = rej })
-  return { resolve, reject, promise, then:promise.then }
+  return { resolve, reject, promise, then:() => promise.then() }
 }
 
 // A map of deferred promises. get(key) returns a promise that is resolved to
@@ -353,7 +353,7 @@ module.exports = function getBroker() {
     send: (epoch, tag, mFunc) => outSocs.forEach((soc,i) => soc.send(''+epoch, ''+tag, mFunc(i))),
     sendTo: (epoch, tag, i, m) => outSocs[i].send(''+epoch, ''+tag, m),
     receive: (epoch, tag, cb) => server.onMessage(''+epoch, ''+tag, cb),
-    receiveFrom: (epoch, tag, cb) => server.onMessageFrom(''+epoch, ''+tag, i, cb),
+    receiveFrom: (epoch, tag, i, cb) => server.onMessageFrom(''+epoch, ''+tag, i, cb),
     allConnected: Promise.all(server.connected).then(() => undefined),
     kConnected: k => {
       const ret = defer()

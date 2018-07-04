@@ -1,0 +1,20 @@
+{
+  "name": "test",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "basic-byzantine": "file:../basic-byzantine",
+    "bn.js": "^4.11.8",
+    "elliptic": "^6.4.0",
+    "n-squared": "file:../n-squared",
+    "sha.js": "^2.4.11",
+    "threshodl": "file:../threshodl"
+  }
+}
