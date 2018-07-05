@@ -321,7 +321,7 @@ module.exports = function getBroker() {
   const thisUsername = process.env.USERNAME
   const thisHostName = process.env.CODIUS_HOST
   let hostPairs = JSON.parse(process.env.CONTRACT_INSTANCES)
-  if (!hostPairs.find(([a,b]) => a === thisUsername && b === thisHostName))
+  if (!hostPairs.find(([a,b]) => a === thisUsername))
     hostPairs.push([thisUsername, thisHostName])
   hostPairs = hostPairs.map(([a]) => a).sort().map(a => hostPairs.find(([_a]) => a === _a))
   const usernames = hostPairs.map(([a]) => a)
