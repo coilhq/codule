@@ -5,7 +5,7 @@
 function defer() {
   let resolve, reject
   const promise = new Promise((res, rej) => { resolve = res; reject = rej })
-  return { resolve, reject, promise, then:() => promise.then() }
+  return { resolve, reject, promise, then:(cb) => promise.then(cb) }
 }
 
 function receive(epoch, tag, broker, parse = (i, m) => m, st = () => Promise.resolve(true), oc = [], on = []) {
@@ -32,7 +32,7 @@ function receive(epoch, tag, broker, parse = (i, m) => m, st = () => Promise.res
         }
       }
       
-      return receive(epoch, tag, broker, parse, st, oc, (on||[]).concat([cb]))
+      return receive(epoch, tag, broker, parse, st, oc, (on||[]).concat([checkMatching]))
     },
     digest:() => {
       const received = [...Array(broker.n)]
@@ -73,7 +73,7 @@ function brachaReceive(epoch, tag, sender, broker, parseInput = (m, ret) => ret.
   let echoed = false, readied = false
   let echoesReceived;
   
-  console.log('HEEEEEEEEEYYYYY ' + tag+'i')
+  console.log('HEEEEEEEEEYYYYY ' + tag+'i '+sender)
   broker.receiveFrom(epoch, tag+'i', sender, m => {
     let parsed = defer()
     parseInput(m, parsed)
@@ -102,7 +102,7 @@ function brachaReceive(epoch, tag, sender, broker, parseInput = (m, ret) => ret.
         readied = true
       }
     }).onCountMatching(n-f, (m, received) => {
-      if (echoesReceived && didntEcho) didntEcho.resolve([ m, echoesReceived ])
+      if (echoesReceived && didntEcho) didntEcho.resolve([ m, [...Array(n)].filter((_, i) => !echoesReceived[i]) ])
       
       result.resolve(m)
     }).digest()
