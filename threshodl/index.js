@@ -2,6 +2,7 @@ const EC = require('elliptic').ec
 const sha = require('sha.js')
 const { randomBytes } = require('crypto')
 const BN = require('bn.js')
+const HmacDRBG = require('hmac-drbg')
 
 // ---------------------------------------------------------------
 
@@ -124,8 +125,11 @@ function hashToStr(m) {
 }
 
 function hashToBuf(m) {
-  let str = hashToStr(m)
-  return Buffer.from(str.padEnd(str.length+3-((str.length-1)&3),'='), 'base64')
+  return sha('sha256').update(m).digest()
+}
+
+function sha512_256(m) {
+  return sha('sha512').update(m).digest('hex').substr(0, 64)
 }
 
 function hashToScalar(m) {
@@ -275,7 +279,7 @@ function merkleBranchVerify(leaf, datum, branch, root) {
 const chaumPedersenDecode = ['P', ['S', 'S']]
 
 function chaumPedersenProve(sk, m) {
-  const H = hashToPoint(m)
+  const H = (m.isPoint) ? m : hashToPoint(m)
   const nonce = genSk()
   const pubNonceG = nonce.mul(G)
   const pubNonceH = nonce.mul(H)
@@ -286,7 +290,7 @@ function chaumPedersenProve(sk, m) {
 }
 
 function chaumPedersenVerify(pk, m, [ sig, [ c, z ] ]) {
-  const H = hashToPoint(m)
+  const H = (m.isPoint) ? m : hashToPoint(m)
   const pubNonceG_ = z.mul(G).add( pk.mul(c))
   const pubNonceH_ = z.mul(H).add(sig.mul(c))
   const c_ = hashToScalar(pubNonceG_.encodeStr() + '||' + pubNonceH_.encodeStr())
@@ -348,14 +352,14 @@ function pedersenVerify(val, mask, commitment) {
   return pedersenCommit(val, mask).equals(commitment)
 }
 
-const pedersenZKDecode = ['P', 'S', schnorrDecode]
+const pedersenPKDecode = ['P', ['S', schnorrDecode]]
 
-function pedersenZKProve(val, mask) {
+function pedersenPKProve(val, mask) {
   const pk = val.mul(G)
-  return [ pk,  mask, schnorrSign(val, '') ]
+  return [ pk,  [ mask, schnorrSign(val, '') ] ]
 }
 
-function pedersenZKVerify([ pk, mask, sig ], commitment) {
+function pedersenPKVerify([ pk, [ mask, sig ] ], commitment) {
   return (pk.add(mask.mul(G1)).equals(commitment) && schnorrVerify(pk, '', sig))
 }
 
@@ -510,70 +514,54 @@ function AVSSPHReceive(epoch, tag, sender, broker, reliableReceive, t) {
 
 // ---------------------------------------------------------------
 
-// Based on Cachin-Kursawe-Shoup threshold signature-based common coin
+// Based on the Cachin-Kursawe-Shoup threshold signature common coin
 // using Boldyreva threshold signatures, but rather than verifying the
 // shares using a pairing we instead use a Chaum-Pedersen NIZK to prove
 // equality of discrete logs. Note this precludes aggregate verification.
-function commonCoin(epoch, tag, sk, pks, broker, t) {
-  t = t||(((broker.n - 1)/3|0) + 1)
-  const result = defer()
+function setupCommonCoin(epoch, tag, sk, pks, broker) {
+  return Promise.resolve((tag_) => {
+    const n = broker.n, f = (n - 1)/3|0
+    const result = defer()
 
-  const id = epoch.length+' '+epoch+tag
-  broker.broadcast(epoch, tag, chaumPedersenEncode(chaumPefersenProve(sk, id)))
-  
-  const shares = [...Array(broker.n)]
-  let count = 0
-  broker.receive(epoch, tag, (i, m) => {
-    chaumPedersenDecode(m, cpProof => {
-      if (chaumPedersenVerify(pks[i], id, cpProof)) {
-        shares[i] = cpProof.sig
-        count++
-        if (count >= t) {
-          result.resolve(hashToStr(interpolate(shares)))
+    const id = epoch.length+' '+tag.length+' '+epoch+tag+tag_
+    broker.broadcast(epoch, tag.length+' '+tag+tag_, 
+      chaumPedersenEncode(chaumPefersenProve(sk, id)))
+    
+    const shares = arrayOf(n)
+    let count = 0
+    broker.receive(epoch, tag.length+' '+tag+tag_, (i, m) => {
+      chaumPedersenDecode(m, cpProof => {
+        if (chaumPedersenVerify(pks[i], id, cpProof)) {
+          shares[i] = cpProof.sig
+          count++
+          if (count >= f+1) {
+            result.resolve(hashToStr(interpolate(shares)))
+          }
         }
-      }
+      })
     })
+    
+    return result
   })
 }
 
-// Modified version of Canetti's threshold-cryptography-free common coin.
-// Modifications are:
-//   - Uses consistent AVSS instead of full AVSS since we're in the computational
-//     setting where we can verify shares.
-//   - Instead of sharing n^2 secrets, we just share s[1],..,s[n] and take
-//     the (i, j) secret to be F(s[i], j), where F is a key-homomorphic prf.
-//   - Most of the protocol is done only once to derive the shared secrets; after
-//     that we use F to derive the partially shared random values for each coin flip.
-//   - A tighter analysis of the overlap of the Z sets reveals that |M|>n/2, so I
-//     increased u to n+1 which makes the coin common-random more often.
-//     Specifically, Pr[c=1 for all nodes], Pr[c=0 for all nodes] >= 0.36 for n>=4.
-//     Credit to Alex Ravsky: https://math.stackexchange.com/a/2442870/207264
-//   - Adds a little bit of extra communication at the end to make it so that if
-//     any node terminates setup with the support set Z, then Z is contained in G.
-//     This allows us to lock G in place so that even if we later add a node to G,
-//     we won't need to reconstruct the share corresponding to this node.
-function setupHeavyCommonCoin(epoch, tag, broker, reliableBroadcast, reliableReceive) {
+function setupKeygenProposals(epoch, tag, broker, reliableBroadcast, reliableReceive) {
   const n = broker.n, f = (n - 1)/3|0
-  const id = epoch.length+' '+epoch+tag
   const result = defer()
 
   // Each node deals a secret
   const r = genSk()
   AVSSPHDeal(epoch, tag+'a'+broker.thisHostIndex, r, broker, reliableBroadcast)
   
-  const avss_instances = arrayOf(n, i => 
+  const AVSSInstances = arrayOf(n, i => 
     AVSSPHReceive(epoch, tag+'a'+i, i, broker, reliableReceive))
   
   const receivedShares = arrayOf(n), receivedAttaches = arrayOf(n),
-        pendingAttaches = arrayOf(n, () => [ ]), pendingAttachesFinalized = arrayOf(n, () => [ ]),
-        pendingReadies = arrayOf(n, () => [ ]), pendingReadiesFinalized = arrayOf(n, () => [ ]),
-        pendingOuters = arrayOf(n, () => [ ])
+        pendingAttaches = arrayOf(n, () => [ ]),
+        pendingAttachesFinalized = arrayOf(n, () => [ ])
         
   const C = [ ], G = [ ]
-  
   let accepted = false, readied = false
-  
-  
   
   function updateAttaches() { pendingAttaches.forEach(([A, Ap]) => {
     if (A && A.every(j => C.includes(j)))
@@ -585,20 +573,9 @@ function setupHeavyCommonCoin(epoch, tag, broker, reliableBroadcast, reliableRec
       Ap.resolve()
   }) }
   
-  function updateReadies() { pendingReadies.forEach(([B, Bp]) => {
-    if (B && B.every(j => G.includes(j)))
-      Bp.resolve(JSON.stringify(B))
-  }) }
-  
-  function updateOuters() { pendingOuters.forEach(([O, Op]) => {
-    if (O && O.every(j => G.includes(j)) &&
-        pendingReadiesFinalized.filter(B => B.every(j => O.includes(j))).length >= n-f)
-      Op.resolve(JSON.stringify(O))
-  }) }
   
   
-  
-  avss_instances.forEach((p, i) => p.then(shareAndCommits => {
+  AVSSInstances.forEach((p, i) => p.then(shareAndCommits => {
     C.push(i)
     updateAttaches()
     updateAttachesFinalized()
@@ -633,11 +610,43 @@ function setupHeavyCommonCoin(epoch, tag, broker, reliableBroadcast, reliableRec
       updateOuters()
       
       if (!readied && G.length >= n-f) {
-        reliableBroadcast(epoch, tag+'g'+broker.thisHostIndex, JSON.stringify(G), broker)
+        result.resolve({ G, A:(i) => (As[i]||[])[0], shares:AVSSInstances })
         readied = true
       }
     })
   }))
+  
+  return result.promise
+}
+
+function setupKeygenProposalsStable(epoch, tag, broker, reliableBroadcast, reliableReceive) {
+  const n = broker.n, f = (n - 1)/3|0
+  const result = defer()
+  
+  const pendingReadies = arrayOf(n, () => [ ]),
+        pendingReadiesFinalized = arrayOf(n, () => [ ]),
+        pendingOuters = arrayOf(n, () => [ ])
+        
+  let G, A, shares
+  
+  function updateReadies() { pendingReadies.forEach(([B, Bp]) => {
+    if (B && B.every(j => G.includes(j)))
+      Bp.resolve(JSON.stringify(B))
+  }) }
+  
+  function updateOuters() { pendingOuters.forEach(([O, Op]) => {
+    if (O && O.every(j => G.includes(j)) &&
+        pendingReadiesFinalized.filter(B => B.every(j => O.includes(j))).length >= n-f)
+      Op.resolve(JSON.stringify(O))
+  }) }
+  
+  
+  
+  setupKeygenProposals(epoch, tag, broker, reliableBroadcast, reliableReceive)
+    .then({ G_, A_, shares_ } => {
+    G = G_; A = A_; shares = shares_
+    reliableBroadcast(epoch, tag+'g'+broker.thisHostIndex, JSON.stringify(G), broker)
+  })
   
   const readies = arrayOf(n, i =>
     reliableReceive(epoch, tag+'g'+i, i, broker, (m, ret) => {
@@ -683,84 +692,300 @@ function setupHeavyCommonCoin(epoch, tag, broker, reliableBroadcast, reliableRec
     acceptedOuters.push(O)
     
     if (acceptedOuters.length >= n-f) {
-      result.resolve([ acceptedOuters.reduce((acc, Oset) => acc.filter(j => Oset.includes(j))),
-                       acceptedOuters.reduce((acc, Oset) => [...new Set([...acc, ...Oset])]) ])
+      const finalZ = acceptedOuters.reduce((acc, Oset) => acc.filter(j => Oset.includes(j))),
+            finalG = acceptedOuters.reduce((acc, Oset) => [...new Set([...acc, ...Oset])])
+      
+      Promise.all(shares.map((p, i) => 
+        (finalG.some(j => A(j).includes(i))) ? p : Promise.resolve(undefined)))
+        .then(shares => {
+        result.resolve({ Z:finalZ, G:finalG, As:arrayOf(n, i => A(i)), shares })
+      })
     }
   }))
   
-  return result.then(([ finalZ, finalG ]) => {
-    const As = pendingAttachesFinalized.map(([A]) => A)
+  return result.promise
+}
+
+// Modified version of Canetti's threshold-cryptography-free common coin.
+// Modifications are:
+//   - Uses consistent AVSS instead of full AVSS since we're in the computational
+//     setting where we can verify shares.
+//   - Instead of sharing n^2 secrets, we just share s[1],..,s[n] and take
+//     the (i, j) secret to be F(s[i], j), where F is a key-homomorphic prf.
+//   - Most of the protocol is done only once to derive the shared secrets; after
+//     that we use F to derive the partially shared random values for each coin flip.
+//   - A tighter analysis of the overlap of the Z sets reveals that |M|>n/2, so I
+//     increased u to n+1 which makes the coin common-random more often.
+//     Specifically, Pr[c=1 for all nodes], Pr[c=0 for all nodes] >= 0.36 for n>=4.
+//     Credit to Alex Ravsky: https://math.stackexchange.com/a/2442870/207264
+//   - Adds a little bit of extra communication at the end to make it so that if
+//     any node terminates setup with the support set Z, then Z is contained in G.
+//     This allows us to lock G in place so that even if we later add a node to G,
+//     we won't need to reconstruct the share corresponding to this node.
+function setupHeavyCommonCoin(epoch, tag, broker, reliableBroadcast, reliableReceive) {
+  const n = broker.n, f = (n - 1)/3|0
+  
+  return setupKeygenProposals(epoch, tag+'s', broker, reliableBroadcast, reliableReceive)
+    .then(({ Z, G, As, shares:keys }) => {
+    const Akeys = arrayOf(n, i => (!G.includes(i)) ? undefined : ({
+      share: add(...As[i].map(j => keys[j].share)),
+      maskShare: add(...As[i].map(j => keys[j].maskShare)),
+      skCommit: add(...As[i].map(j => keys[j].skCommit)),
+      shareCommits: arrayOf(n, x => add(...As[i].map(j => keys[j].shareCommits[x])))
+    }))
     
-    return Promise.all(avss_instances.map((p, i) => 
-      (finalG.some(j => As[j].includes(i))) ? p : Promise.resolve(undefined)))
-    .then((keys) => {
-      console.log(As)
-      console.log(keys)
-      const Akeys = arrayOf(n, i => (!finalG.includes(i)) ? undefined : ({
-        share: add(...As[i].map(j => keys[j].share)),
-        maskShare: add(...As[i].map(j => keys[j].maskShare)),
-        skCommit: add(...As[i].map(j => keys[j].skCommit)),
-        shareCommits: arrayOf(n, x => add(...As[i].map(j => keys[j].shareCommits[x])))
-      }))
-      
-      function thresholdPRF(i, tag_) {
-        const { share, maskShare, skCommit } = Akeys[i]
-        return chaumPedersenPHProve(share, maskShare, skCommit.encodeStr()+' '+i+' '+tag_)
-      }
-      
-      function verifyPRFShare(i, tag_, sender, PRFShare) {
-        const { shareCommits, skCommit } = Akeys[i]
-        return chaumPedersenPHVerify(shareCommits[sender],
-                                     skCommit.encodeStr()+' '+i+' '+tag_, PRFShare)
-      }
-      
-      return {
-        flipCoin: (tag_) => {
-          const result_ = defer()
-          
-          const shares = 
-            finalG.reduce((acc, i) => [...acc, [i, encodeData(thresholdPRF(i, tag_))]], [])
-          broker.broadcast(epoch, tag_, JSON.stringify(shares))
-          
-          const acceptedCoinShares = arrayOf(n, () => arrayOf(n))
-          let count = 0
-          broker.receive(epoch, tag_, (i, m) => {
-            const verifiedShares = arrayOf(n)
-            let otherShares
-            try {
-              otherShares = JSON.parse(m).map(([j, PRFShareRaw]) => {
-                decodeData(PRFShareRaw, chaumPedersenPHDecode, PRFShare => {
-                  if (verifyPRFShare(j, tag_, i, PRFShare)) verifiedShares[j] = PRFShare[0]
-                })
+    function thresholdPRF(i, tag_) {
+      const { share, maskShare, skCommit } = Akeys[i]
+      const id = skCommit.encodeStr()+' '+i+' '+epoch.length+' '+tag.length+epoch+tag+tag_
+      return chaumPedersenPHProve(share, maskShare, id)
+    }
+    
+    function verifyPRFShare(i, tag_, sender, PRFShare) {
+      const { shareCommits, skCommit } = Akeys[i]
+      const id = skCommit.encodeStr()+' '+i+' '+epoch.length+' '+tag.length+epoch+tag+tag_
+      return chaumPedersenPHVerify(shareCommits[sender], id, PRFShare)
+    }
+    
+    return {
+      flipCoin: (tag_) => {
+        const result_ = defer()
+        
+        const shares = G.reduce((acc, i) => [...acc, [i, encodeData(thresholdPRF(i, tag_))]], [])
+        broker.broadcast(epoch, tag.length+'_'+tag+tag_, JSON.stringify(shares))
+        
+        const acceptedCoinShares = arrayOf(n, () => arrayOf(n))
+        let count = 0
+        broker.receive(epoch, tag.length+'_'+tag+tag_, (i, m) => {
+          const verifiedShares = arrayOf(n)
+          let otherShares
+          try {
+            otherShares = JSON.parse(m).map(([j, PRFShareRaw]) => {
+              decodeData(PRFShareRaw, chaumPedersenPHDecode, PRFShare => {
+                if (verifyPRFShare(j, tag_, i, PRFShare)) verifiedShares[j] = PRFShare[0]
               })
-            } catch (e) { return }
-            
-            console.log(verifiedShares)
-            
-            if (finalZ.every(j => verifiedShares[j])) {
-              verifiedShares.forEach((sig, j) => acceptedCoinShares[j][i] = sig)
-              count++
-            }
-            
-            if (count >= f+1) {
-              result_.resolve(finalZ.map(j => interpolate(acceptedCoinShares[j]))
-                             .every(sig => !(hashToScalar(sig.encodeStr()).val.modn(n+1) === 0)))
-              console.log(finalZ.map(j => interpolate(acceptedCoinShares[j]))
-                             .map(sig => hashToScalar(sig.encodeStr()).val.modn(n+1)))
-            }
-          })
+            })
+          } catch (e) { return }
           
-          return result_
-        }
+          console.log(verifiedShares)
+          
+          if (Z.every(j => verifiedShares[j])) {
+            verifiedShares.forEach((sig, j) => acceptedCoinShares[j][i] = sig)
+            count++
+          }
+          
+          if (count >= f+1) {
+            result_.resolve(Z.map(j => interpolate(acceptedCoinShares[j]))
+                           .every(sig => !(hashToScalar(sig.encodeStr()).val.modn(n+1) === 0)))
+            console.log(Z.map(j => interpolate(acceptedCoinShares[j]))
+                           .map(sig => hashToScalar(sig.encodeStr()).val.modn(n+1)))
+          }
+        })
+        
+        return result_
       }
-    })
+    }
   })
 }
 
-function keyGenSync(epoch, tag, t, broker) {
+function keyGenAsync(epoch, tag, broker, reliableBroadcast, reliableReceive, setupConsensus) {
+  const thresholdShare = defer(), result = defer()
   
+  const proposals =
+    setupKeygenProposals(epoch, tag+'g', broker, reliableBroadcast, reliableReceive)
+  
+  const consensus = setupConsensus(epoch, tag+'c', broker)
+  
+  Promise.all(proposals, consensus)
+    .then(([ { G, A, shares }, consensus ]) => {
+    consensus.vote(G)
+    consensus.then(G_ => {
+      const i = G_.sort()[0]
+      thresholdShare.resolve({
+        share: add(...As[i].map(j => shares[j].share)),
+        maskShare: add(...As[i].map(j => shares[j].maskShare)),
+        skCommit: add(...As[i].map(j => shares[j].skCommit)),
+        shareCommits: arrayOf(n, x => add(...As[i].map(j => shares[j].shareCommits[x])))
+      })
+    })
+  })
+  
+  thresholdShare.then(({ share, maskShare, skCommit, shareCommits }) => {
+    broker.broadcast(epoch, tag+'f', encodeData(pedersenPKProve(share, maskShare)))
+    
+    const pks = arrayOf(n)
+    let count = 0
+    broker.receive(epoch, tag+'f', (i, m) => {
+      decodeData(m, pedersenPKDecode, ([ pk, proof ]) => {
+        if (pedersenPKVerify([ pk, proof ], shareCommits[i])) {
+          pks[i] = pk
+          count++
+          
+          if (count >= f+1) {
+            const sharePKs = arrayOf(n, i => pks[i]||interpolate(pks, i+1))
+            const pk = interpolate(pks)
+            
+            result.resolve({ share, sharePKs, pk })
+          }
+        }
+      })
+    })
+  })
+  
+  return result
+}
+
+function thresholdECDSA(epoch, tag, broker, thresholdShare, m, keyGen) {
+  function truncateToN(msg, truncOnly) {
+    const delta = msg.byteLength() * 8 - e.n.bitLength()
+    if (delta > 0)
+      msg = msg.ushrn(delta)
+    if (!truncOnly && msg.cmp(ecc.curve.n) >= 0)
+      return msg.sub(ecc.curve.n)
+    else
+      return msg
+  }
+  
+  function toDER(r, s) {
+    function constructLength(arr, len) {
+      if (len < 0x80) {
+        arr.push(len)
+        return
+      }
+      
+      let octets = 1 + (Math.log(len) / Math.LN2 >>> 3)
+      arr.push(octets | 0x80)
+      while (--octets) {
+        arr.push((len >>> (octets << 3)) & 0xff)
+      }
+      
+      arr.push(len)
+    }
+
+    function rmPadding(buf) {
+      let i = 0
+      const len = buf.length - 1
+      while (!buf[i] && !(buf[i + 1] & 0x80) && i < len) {
+        i++
+      }
+      if (i === 0) {
+        return buf
+      }
+      return buf.slice(i)
+    }
+
+    // Pad values
+    if (r[0] & 0x80)
+      r = [ 0 ].concat(r)
+    // Pad values
+    if (s[0] & 0x80)
+      s = [ 0 ].concat(s)
+
+    r = rmPadding(r)
+    s = rmPadding(s)
+
+    while (!s[0] && !(s[1] & 0x80)) {
+      s = s.slice(1)
+    }
+    
+    let arr = [ 0x02 ]
+    constructLength(arr, r.length)
+    arr = arr.concat(r)
+    arr.push(0x02)
+    constructLength(arr, s.length)
+    const backHalf = arr.concat(s)
+    let res = [ 0x30 ]
+    constructLength(res, backHalf.length)
+    res = res.concat(backHalf)
+    return Buffer.from(res).toString('hex')
+  }
+  
+  async function sign(msg, sk) {
+    const msgHash = truncateToN(new BN(sha512_256(msg), 16))
+
+    // Zero-extend key to provide enough entropy
+    const bytes = ecc.curve.n.byteLength()
+    let bkey = sk.toArray('be', bytes)
+
+    // Zero-extend nonce to have the same byte size as N
+    const nonce = msgHash.toArray('be', bytes)
+
+    // Instantiate Hmac_DRBG
+    const drbg = new HmacDRBG({
+      hash: ecc.curve.hash,
+      entropy: bkey,
+      nonce: nonce,
+      persEnc: 'utf8'
+    })
+
+    // Number of bytes to generate
+    const ns1 = ecc.curve.n.sub(new BN(1));
+
+    for (let iter = 0; true; iter++) {
+      // Computes kInv by generating shares of a second random secret b, then revealing k*b
+      // and applying the linear function x->x/(k*b) to our share of b.
+      let [ k, kInv ] = await
+        Promise.all([ keyGen(epoch, tag+'n'+iter+'_'), keyGen(epoch, tag+'b'+iter+'_') ])
+        .then(([{ share:k, sharePKs:kSharePKs, pk:kPK },
+               { share:b, sharePKs:bSharePKs, pk:bPK }]) => {
+        const result = defer()
+        const kbShare = k.mul(b), proof = chaumPedersenProve(k, bSharePKs[broker.thisHostIndex])
+        broker.broadcast(epoch, tag+'r'+iter, encodeData([ kbShare, proof ]))
+        
+        const kbShares = arrayOf(n)
+        let count = 0
+        broker.receive(epoch, tag+'r'+iter, (i, m) => {
+          decodeData(m, ['S', chaumPedersenDecode], ([ kbShare, proof ]) => {
+            if (chaumPedersenVerify(kSharePKs[i], bSharePKs[i], proof) &&
+                proof[0].equals(kbShare.mul(G))) {
+              kbShares[i] = kbShare
+              count++
+              
+              if (count >= 2*f+1) {
+                result.resolve([ k, b.div(interpolate(kbShares)) ])
+              }
+            }
+          })
+        })
+        
+        return result
+      })
+      
+      k = k.val.fromRed()
+      kInv = kInv.val.fromRed()
+      
+      if (k.cmpn(1) <= 0 || k.cmp(ns1) >= 0)
+        continue;
+
+      const kp = kPK
+      if (kp.isInfinity())
+        continue;
+
+      const kpX = kp.getX()
+      const r = kpX.umod(ecc.curve.n)
+      if (r.cmpn(0) === 0)
+        continue;
+
+      let s = kInv.mul(r.mul(sk).iadd(msgHash))
+      s = s.umod(ecc.curve.n)
+      if (s.cmpn(0) === 0)
+        continue;
+
+      let recoveryParam = (kp.getY().isOdd() ? 1 : 0) |
+                          (kpX.cmp(r) !== 0 ? 2 : 0)
+
+      // Use complement of `s`, if it is > `n / 2`
+      if (s.cmp(ecc.curve.nh) > 0) {
+        s = ecc.curve.n.sub(s)
+        recoveryParam ^= 1
+      }
+
+      return toDer(r, s)
+    }
+  }
 }
 
 module.exports = {
-  setupHeavyCommonCoin
+  setupHeavyCommonCoin,
+  setupCommonCoin,
+  keyGenAsync
 }
