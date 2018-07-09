@@ -117,7 +117,14 @@ function scalar(val_) {
 }
 
 function genSk() {
-  return scalar(randomBytes(skLength))
+  while (true) {
+    const r = new BN(randomBytes(skLength))
+    
+    if (r.cmpn(0) <= 0 || r.cmp(ecc.curve.n) >= 0)
+      continue;
+    
+    return scalar(r)
+  }
 }
 
 function hashToStr(m) {
@@ -167,9 +174,9 @@ function replaceECStuffWithStrs(obj) {
   if (typeof obj !== 'object') {
     if (typeof obj === 'string') return 'T'+obj
     else if (typeof obj === 'number') return 'N'+obj.toString(36)
-    else throw 'encoding error'
+    else throw new Error('encoding error: ' + obj)
   } else if (!obj.isPoint && !obj.isScalar) {
-    if (!Array.isArray(obj)) throw 'encoding error'
+    if (!Array.isArray(obj)) throw new Error('encoding error: not an array')
     
     else return obj.map(subObj => replaceECStuffWithStrs(subObj))
   } else {
@@ -400,7 +407,7 @@ function interpolate(shares_, x_ = 0) {
 // ---------------------------------------------------------------
 
 // TODO: add polynomial commitments for better communication complexity
-function AVSSPHDeal(epoch, tag, sk, broker, reliableBroadcast, t) {
+function AVSSPHDeal(tag, sk, broker, reliableBroadcast, t) {
   const n = broker.n, f = (n - 1)/3|0
   t = t||f+1
   
@@ -427,21 +434,21 @@ function AVSSPHDeal(epoch, tag, sk, broker, reliableBroadcast, t) {
 
   const mFunc = i => encodeData([ shares[i], maskShares[i], subShares[i], subMaskShares[i],
                                   skCommit, coeffCommits, subCoeffCommits ])
-  reliableBroadcast(epoch, tag, mFunc, broker)
+  reliableBroadcast(tag, mFunc, broker)
 
   return hashToStr(encodeData([ skCommit, coeffCommits, subCoeffCommits ]))
 }
 
-function AVSSPHReceive(epoch, tag, sender, broker, reliableReceive, t) {
-  console.log('started from the bottom now we still at the bottom')
+function AVSSPHReceive(tag, sender, broker, reliableReceive, t) {
   const n = broker.n, f = (n - 1)/3|0
   t = t||f+1
   const result = defer(), didntEcho = defer(), shouldRecover = defer(), recoveredValue = defer()
-  let echoed = false, readied = false
+  let echoed = false, readied = false, recovered = false
   
   let share, maskShare, subShares, subMaskShares, skCommit, coeffCommits, subCoeffCommits, h
 
-  reliableReceive(epoch, tag, sender, broker, (m, ret) => {
+  reliableReceive(tag, sender, broker, m => {
+    const ret = defer()
     if (echoed) return true
     
     decodeData(m, ['S', 'S', arrayOf(n, _ => 'S'),
@@ -466,41 +473,50 @@ function AVSSPHReceive(epoch, tag, sender, broker, reliableReceive, t) {
           
           didntEcho.then(([ h_, unrecoveredNodes ]) => {
             if (h !== h_) return;
-            unrecoveredNodes.forEach(j => broker.sendTo(epoch, tag+'u', j, 
+            unrecoveredNodes.forEach(j => broker.sendTo(tag+'u', j, 
                                 encodeData([ subShares[j], subMaskShares[j], skCommit,
                                              shareCommits, subCoeffCommits[j] ])))
           })
           
-          recoveredValue.resolve({ share, maskShare, skCommit, shareCommits })
+          shouldRecover.then(h_ => {
+            if (h === h_) {
+              recoveredValue.resolve({ share, maskShare, skCommit, shareCommits })
+              recovered = true
+            }
+          })
         }
       }
     })
+    
+    return ret.promise
   }, didntEcho)
-  .then(() => {
-    shouldRecover.resolve()
+  .then(h_ => {
+    shouldRecover.resolve(h_)
     result.resolve(recoveredValue)
   })
   
   const recoveryData = arrayOf(n)
-  broker.receive(epoch, tag+'u', (i, data) => {
+  broker.receive(tag+'u', (i, data) => {
     if (recovered) return true
     
     decodeData(data, ['S', 'S', 'P',
                        arrayOf(n, _ => 'P'),
                        arrayOf(f, _ => 'P')],
     ([ subShare, subMaskShare, skCommit, shareCommits, subCoeffCommits ]) => {
-      const c_ = hashToStr(encodeData([skCommit, coeffCommits, subCoeffCommits]))
+      const c_ = hashToStr(encodeData([skCommit, shareCommits, subCoeffCommits]))
       recoveryData[i] = { subShare, subMaskShare, c_, tested:false }
       
-      shouldRecover.then(() => {
-        if (recovered) return;
+      shouldRecover.then((h_) => {
+        if ((h && h === h_) || recovered) return;
         
         if (pedersenCommit(subShare, subMaskShare)
             .equals(polyEvalPlayer(shareCommits[broker.thisHostIndex], subCoeffCommits)(i))) {
           recoveryData[i].tested = true
           
-          let matching = recoveryData.filter(dat => (dat.tested && dat.c_ === c_))
+          let matching = recoveryData.filter(dat => (dat && dat.tested && dat.c_ === c_))
           if (matching.length >= f+1) {
+            share = interpolate(recoveryData.map(dat => dat && dat.subShare))
+            maskShare = interpolate(recoveryData.map(dat => dat && dat.subMaskShare))
             recoveredValue.resolve({ share, maskShare, skCommit, shareCommits })
             recovered = true
           }
@@ -518,18 +534,18 @@ function AVSSPHReceive(epoch, tag, sender, broker, reliableReceive, t) {
 // using Boldyreva threshold signatures, but rather than verifying the
 // shares using a pairing we instead use a Chaum-Pedersen NIZK to prove
 // equality of discrete logs. Note this precludes aggregate verification.
-function setupCommonCoin(epoch, tag, sk, pks, broker) {
+function setupCommonCoin(tag, broker, sk, pks) {
   return Promise.resolve((tag_) => {
     const n = broker.n, f = (n - 1)/3|0
     const result = defer()
 
-    const id = epoch.length+' '+tag.length+' '+epoch+tag+tag_
-    broker.broadcast(epoch, tag.length+' '+tag+tag_, 
+    const id = tag.length+' '+tag+tag_
+    broker.broadcast(tag+tag_, 
       chaumPedersenEncode(chaumPefersenProve(sk, id)))
     
     const shares = arrayOf(n)
     let count = 0
-    broker.receive(epoch, tag.length+' '+tag+tag_, (i, m) => {
+    broker.receive(tag+tag_, (i, m) => {
       chaumPedersenDecode(m, cpProof => {
         if (chaumPedersenVerify(pks[i], id, cpProof)) {
           shares[i] = cpProof.sig
@@ -541,167 +557,193 @@ function setupCommonCoin(epoch, tag, sk, pks, broker) {
       })
     })
     
-    return result
+    return result.promise
   })
 }
 
-function setupKeygenProposals(epoch, tag, broker, reliableBroadcast, reliableReceive) {
+function setupKeygenProposals(tag, broker, reliableBroadcast, reliableReceive) {
   const n = broker.n, f = (n - 1)/3|0
   const result = defer()
 
   // Each node deals a secret
   const r = genSk()
-  AVSSPHDeal(epoch, tag+'a'+broker.thisHostIndex, r, broker, reliableBroadcast)
+  AVSSPHDeal(tag+'a'+broker.thisHostIndex, r, broker, reliableBroadcast)
   
   const AVSSInstances = arrayOf(n, i => 
-    AVSSPHReceive(epoch, tag+'a'+i, i, broker, reliableReceive))
+    AVSSPHReceive(tag+'a'+i, i, broker, reliableReceive))
   
-  const receivedShares = arrayOf(n), receivedAttaches = arrayOf(n),
-        pendingAttaches = arrayOf(n, () => [ ]),
-        pendingAttachesFinalized = arrayOf(n, () => [ ])
+  const pendingAttaches = arrayOf(n, () => [ defer(), defer() ]),
+        pendingAttachesFinalized = arrayOf(n, () => [ defer(), defer() ])
         
   const C = [ ], G = [ ]
   let accepted = false, readied = false
   
-  function updateAttaches() { pendingAttaches.forEach(([A, Ap]) => {
-    if (A && A.every(j => C.includes(j)))
-      Ap.resolve(JSON.stringify(A))
-  }) }
-  
-  function updateAttachesFinalized() { pendingAttachesFinalized.forEach(([A, Ap]) => {
-    if (A && A.every(j => C.includes(j)))
-      Ap.resolve()
-  }) }
+  function update(arr) {
+    arr.forEach(async ([p1, p2]) => {
+      const A = await p1
+      if (A.every(i => C.includes(i)))
+        p2.resolve(A)
+    })
+  }
   
   
   
-  AVSSInstances.forEach((p, i) => p.then(shareAndCommits => {
-    C.push(i)
-    updateAttaches()
-    updateAttachesFinalized()
+  AVSSInstances.forEach(async (p, i) => {
+    await p
     
-    receivedShares[i] = shareAndCommits
+    C.push(i)
+    update(pendingAttaches)
+    update(pendingAttachesFinalized)
+    
     if (!accepted && C.length >= f+1) {
-      reliableBroadcast(epoch, tag+'c'+broker.thisHostIndex, JSON.stringify(C), broker)
+      reliableBroadcast(tag+'c'+broker.thisHostIndex, JSON.stringify(C), broker)
       accepted = true
     }
-  }))
+  })
   
   const attaches = arrayOf(n, i =>
-    reliableReceive(epoch, tag+'c'+i, i, broker, (m, ret) => {
-      if (pendingAttaches[i][0]) return;
+    reliableReceive(tag+'c'+i, i, broker, m => {
       try {
         let A = [...(new Set(JSON.parse(m))).values()]
         if (A.length >= f+1) {
-          pendingAttaches[i] = [A, ret]
-          updateAttaches()
+          pendingAttaches[i][0].resolve(A)
         }
       } catch (e) { }
+      
+      return pendingAttaches[i][1].then(A => JSON.stringify(A))
     }))
   
-  attaches.forEach((p, i) => p.then(Araw => {
-    const A = JSON.parse(Araw)
-    pendingAttachesFinalized[i] = [A, defer()]
-    updateAttachesFinalized()
+  let onAddToG_ = () => { }
+  attaches.forEach(async (p, i) => {
+    const A = JSON.parse(await p)
+    pendingAttachesFinalized[i][0].resolve(A)
     
-    pendingAttachesFinalized[i][1].then(() => {
-      G.push(i)
-      updateReadies()
-      updateOuters()
-      
-      if (!readied && G.length >= n-f) {
-        result.resolve({ G, A:(i) => (As[i]||[])[0], shares:AVSSInstances })
-        readied = true
-      }
-    })
-  }))
+    await pendingAttachesFinalized[i][1]
+    
+    G.push(i)
+    onAddToG_()
+    
+    if (!readied && G.length >= n-f) {
+      result.resolve({
+        G,
+        As:pendingAttachesFinalized.map(([p1, p2]) => p2),
+        shares:AVSSInstances,
+        onAddToG: cb => { cb(); cb => onAddToG_ = cb }
+      })
+      readied = true
+    }
+  })
   
   return result.promise
 }
 
-function setupKeygenProposalsStable(epoch, tag, broker, reliableBroadcast, reliableReceive) {
+async function setupKeygenProposalsStable(tag, broker, reliableBroadcast, reliableReceive) {
   const n = broker.n, f = (n - 1)/3|0
   const result = defer()
   
-  const pendingReadies = arrayOf(n, () => [ ]),
-        pendingReadiesFinalized = arrayOf(n, () => [ ]),
-        pendingOuters = arrayOf(n, () => [ ])
-        
-  let G, A, shares
+  const pendingReadies = arrayOf(n, () => [ defer(), defer() ]),
+        pendingReadiesFinalized = arrayOf(n, () => [ defer(), defer() ]),
+        pendingOuters = arrayOf(n, () => [ defer(), defer(), defer() ]),
+        pendingOutersFinalized = arrayOf(n, () => [ defer(), defer() ])
   
-  function updateReadies() { pendingReadies.forEach(([B, Bp]) => {
-    if (B && B.every(j => G.includes(j)))
-      Bp.resolve(JSON.stringify(B))
-  }) }
-  
-  function updateOuters() { pendingOuters.forEach(([O, Op]) => {
-    if (O && O.every(j => G.includes(j)) &&
-        pendingReadiesFinalized.filter(B => B.every(j => O.includes(j))).length >= n-f)
-      Op.resolve(JSON.stringify(O))
-  }) }
-  
-  
-  
-  setupKeygenProposals(epoch, tag, broker, reliableBroadcast, reliableReceive)
-    .then({ G_, A_, shares_ } => {
-    G = G_; A = A_; shares = shares_
-    reliableBroadcast(epoch, tag+'g'+broker.thisHostIndex, JSON.stringify(G), broker)
+  pendingOuters.forEach(async ([p1, p2, p3], i) => {
+    const O = await p3
+    let count = 0
+    
+    pendingReadiesFinalized.forEach(async ([p1B]) => {
+      const B = await p1B
+      
+      if (B.every(j => O.includes(j))) {
+        count++
+        if (count >= n-f)
+          p1.resolve(O)
+      }
+    })
   })
   
+  
+  
+  const { G, As, shares, onAddToG } = 
+    await setupKeygenProposals(tag, broker, reliableBroadcast, reliableReceive)
+  
+  reliableBroadcast(tag+'g'+broker.thisHostIndex, JSON.stringify(G), broker)
+  
+  function update(arr) {
+    arr.forEach(async ([p1, p2]) => {
+      const A = await p1
+      if (A.every(i => G.includes(i)))
+        p2.resolve(A)
+    })
+  }
+  
+  onAddToG(() => {
+    update(pendingReadies)
+    update(pendingReadiesFinalized)
+    update(pendingOuters)
+    update(pendingOutersFinalized)
+  })
+  
+  
+  
   const readies = arrayOf(n, i =>
-    reliableReceive(epoch, tag+'g'+i, i, broker, (m, ret) => {
-      if (pendingReadies[i][0]) return;
+    reliableReceive(tag+'g'+i, i, broker, m => {
       try {
         let B = [...(new Set(JSON.parse(m))).values()]
         if (B.length >= n-f) {
-          pendingReadies[i] = [B, ret]
-          updateReadies()
+          pendingReadies[i][0].resolve(B)
         }
       } catch (e) { }
+      
+      return pendingReadies[i][1].then(B => JSON.stringify(B))
     }))
   
-  let countG = 0, outerd = false
-  readies.forEach((p, i) => p.then(Braw => {
-    const B = JSON.parse(Braw)
+  let countB = 0, outerd = false
+  readies.forEach(async (p, i) => {
+    const B = JSON.parse(await p)
+    pendingReadiesFinalized[i][0].resolve(B)
     
-    pendingReadiesFinalized[i] = B
-    updateOuters()
+    await pendingReadiesFinalized[i][1]
     
-    countG++
-    if (!outerd && countG >= n-f) {
-      reliableBroadcast(epoch, tag+'o'+broker.thisHostIndex, JSON.stringify(G), broker)
+    countB++
+    if (!outerd && countB >= n-f) {
+      reliableBroadcast(tag+'o'+broker.thisHostIndex, JSON.stringify(G), broker)
       outerd = true
     }
-  }))
+  })
   
   const outers = arrayOf(n, i =>
-    reliableReceive(epoch, tag+'o'+i, i, broker, (m, ret) => {
-      if (pendingOuters[i][0]) return;
+    reliableReceive(tag+'o'+i, i, broker, m => {
       try {
         let O = [...(new Set(JSON.parse(m))).values()]
         if (O.length >= n-f) {
-          pendingOuters[i] = [O, ret]
-          updateOuters()
+          pendingOuters[i][2].resolve(O)
         }
       } catch (e) { }
+      
+      return pendingOuters[i][1].then(O => JSON.stringify(O))
     }))
   
   let acceptedOuters = [ ]
-  outers.forEach((p, i) => p.then(Oraw => {
-    const O = JSON.parse(Oraw)
+  outers.forEach(async (p, i) => {
+    const O = JSON.parse(await p)
+    pendingOutersFinalized[i][0].resolve(O)
+    
+    await pendingOutersFinalized[i][1]
+    
     acceptedOuters.push(O)
     
     if (acceptedOuters.length >= n-f) {
       const finalZ = acceptedOuters.reduce((acc, Oset) => acc.filter(j => Oset.includes(j))),
             finalG = acceptedOuters.reduce((acc, Oset) => [...new Set([...acc, ...Oset])])
       
-      Promise.all(shares.map((p, i) => 
-        (finalG.some(j => A(j).includes(i))) ? p : Promise.resolve(undefined)))
-        .then(shares => {
-        result.resolve({ Z:finalZ, G:finalG, As:arrayOf(n, i => A(i)), shares })
-      })
+      const As_ = await Promise.all(As.map((p,j) => 
+        G.includes(j) ? p : Promise.resolve(undefined)))
+      const shares_ = await Promise.all(shares.map((p, i) => 
+        As_.some(A => (A && A.includes(i))) ? p : Promise.resolve(undefined)))
+      
+      result.resolve({ Z:finalZ, G:finalG, As:As_, shares:shares_ })
     }
-  }))
+  })
   
   return result.promise
 }
@@ -722,121 +764,122 @@ function setupKeygenProposalsStable(epoch, tag, broker, reliableBroadcast, relia
 //     any node terminates setup with the support set Z, then Z is contained in G.
 //     This allows us to lock G in place so that even if we later add a node to G,
 //     we won't need to reconstruct the share corresponding to this node.
-function setupHeavyCommonCoin(epoch, tag, broker, reliableBroadcast, reliableReceive) {
+async function setupHeavyCommonCoin(tag, broker, reliableBroadcast, reliableReceive) {
   const n = broker.n, f = (n - 1)/3|0
   
-  return setupKeygenProposals(epoch, tag+'s', broker, reliableBroadcast, reliableReceive)
-    .then(({ Z, G, As, shares:keys }) => {
-    const Akeys = arrayOf(n, i => (!G.includes(i)) ? undefined : ({
-      share: add(...As[i].map(j => keys[j].share)),
-      maskShare: add(...As[i].map(j => keys[j].maskShare)),
-      skCommit: add(...As[i].map(j => keys[j].skCommit)),
-      shareCommits: arrayOf(n, x => add(...As[i].map(j => keys[j].shareCommits[x])))
-    }))
+  const { Z, G, As, shares:keys }
+    = await setupKeygenProposalsStable(tag+'s', broker, reliableBroadcast, reliableReceive)
+  
+  console.error(keys)
+  
+  const Akeys = arrayOf(n, i => As[i] && ({
+    share: add(...As[i].map(j => keys[j].share)),
+    maskShare: add(...As[i].map(j => keys[j].maskShare)),
+    skCommit: add(...As[i].map(j => keys[j].skCommit)),
+    shareCommits: arrayOf(n, x => add(...As[i].map(j => keys[j].shareCommits[x])))
+  }))
+  
+  function thresholdPRF(i, tag_) {
+    const { share, maskShare, skCommit } = Akeys[i]
+    const id = skCommit.encodeStr()+' '+i+' '+tag.length+tag+tag_
+    return chaumPedersenPHProve(share, maskShare, id)
+  }
+  
+  function verifyPRFShare(i, tag_, sender, PRFShare) {
+    const { shareCommits, skCommit } = Akeys[i]
+    const id = skCommit.encodeStr()+' '+i+' '+tag.length+tag+tag_
+    return chaumPedersenPHVerify(shareCommits[sender], id, PRFShare)
+  }
+  
+  return (tag_) => {
+    const result = defer()
     
-    function thresholdPRF(i, tag_) {
-      const { share, maskShare, skCommit } = Akeys[i]
-      const id = skCommit.encodeStr()+' '+i+' '+epoch.length+' '+tag.length+epoch+tag+tag_
-      return chaumPedersenPHProve(share, maskShare, id)
-    }
+    const shares = G.reduce((acc, i) => [...acc, [i, encodeData(thresholdPRF(i, tag_))]], [])
+    broker.broadcast(tag+tag_, JSON.stringify(shares))
     
-    function verifyPRFShare(i, tag_, sender, PRFShare) {
-      const { shareCommits, skCommit } = Akeys[i]
-      const id = skCommit.encodeStr()+' '+i+' '+epoch.length+' '+tag.length+epoch+tag+tag_
-      return chaumPedersenPHVerify(shareCommits[sender], id, PRFShare)
-    }
-    
-    return {
-      flipCoin: (tag_) => {
-        const result_ = defer()
-        
-        const shares = G.reduce((acc, i) => [...acc, [i, encodeData(thresholdPRF(i, tag_))]], [])
-        broker.broadcast(epoch, tag.length+'_'+tag+tag_, JSON.stringify(shares))
-        
-        const acceptedCoinShares = arrayOf(n, () => arrayOf(n))
-        let count = 0
-        broker.receive(epoch, tag.length+'_'+tag+tag_, (i, m) => {
-          const verifiedShares = arrayOf(n)
-          let otherShares
-          try {
-            otherShares = JSON.parse(m).map(([j, PRFShareRaw]) => {
-              decodeData(PRFShareRaw, chaumPedersenPHDecode, PRFShare => {
-                if (verifyPRFShare(j, tag_, i, PRFShare)) verifiedShares[j] = PRFShare[0]
-              })
-            })
-          } catch (e) { return }
-          
-          console.log(verifiedShares)
-          
-          if (Z.every(j => verifiedShares[j])) {
-            verifiedShares.forEach((sig, j) => acceptedCoinShares[j][i] = sig)
-            count++
-          }
-          
-          if (count >= f+1) {
-            result_.resolve(Z.map(j => interpolate(acceptedCoinShares[j]))
-                           .every(sig => !(hashToScalar(sig.encodeStr()).val.modn(n+1) === 0)))
-            console.log(Z.map(j => interpolate(acceptedCoinShares[j]))
-                           .map(sig => hashToScalar(sig.encodeStr()).val.modn(n+1)))
-          }
+    const acceptedCoinShares = arrayOf(n, () => arrayOf(n))
+    let count = 0
+    broker.receive(tag+tag_, (i, m) => {
+      const verifiedShares = arrayOf(n)
+      let otherShares
+      try {
+        otherShares = JSON.parse(m).map(([j, PRFShareRaw]) => {
+          decodeData(PRFShareRaw, chaumPedersenPHDecode, PRFShare => {
+            if (verifyPRFShare(j, tag_, i, PRFShare)) verifiedShares[j] = PRFShare[0]
+          })
         })
-        
-        return result_
+      } catch (e) { return }
+      
+      console.log(verifiedShares)
+      
+      if (Z.every(j => verifiedShares[j])) {
+        verifiedShares.forEach((sig, j) => acceptedCoinShares[j][i] = sig)
+        count++
       }
-    }
-  })
+      
+      if (count >= f+1) {
+        result.resolve(Z.map(j => interpolate(acceptedCoinShares[j]))
+                       .every(sig => !(hashToScalar(sig.encodeStr()).val.modn(n+1) === 0)))
+        console.log(Z.map(j => interpolate(acceptedCoinShares[j]))
+                       .map(sig => hashToScalar(sig.encodeStr()).val.modn(n+1)))
+      }
+    })
+    
+    return result.promise
+  }
 }
 
-function keyGenAsync(epoch, tag, broker, reliableBroadcast, reliableReceive, setupConsensus) {
-  const thresholdShare = defer(), result = defer()
+async function keyGenAsync(tag, broker, reliableBroadcast, reliableReceive, setupConsensus) {
+  const n = broker.n, f = (n-1)/3|0
+  const result = defer()
   
   const proposals =
-    setupKeygenProposals(epoch, tag+'g', broker, reliableBroadcast, reliableReceive)
+    setupKeygenProposals(tag+'g', broker, reliableBroadcast, reliableReceive)
   
-  const consensus = setupConsensus(epoch, tag+'c', broker)
+  const consensusSetup = setupConsensus(tag+'c', broker)
   
-  Promise.all(proposals, consensus)
-    .then(([ { G, A, shares }, consensus ]) => {
-    consensus.vote(G)
-    consensus.then(G_ => {
-      const i = G_.sort()[0]
-      thresholdShare.resolve({
-        share: add(...As[i].map(j => shares[j].share)),
-        maskShare: add(...As[i].map(j => shares[j].maskShare)),
-        skCommit: add(...As[i].map(j => shares[j].skCommit)),
-        shareCommits: arrayOf(n, x => add(...As[i].map(j => shares[j].shareCommits[x])))
-      })
-    })
-  })
+  const [ { G, As, shares }, consensus ] =  await Promise.all([ proposals, consensusSetup ])
+  consensus.vote(G)
   
-  thresholdShare.then(({ share, maskShare, skCommit, shareCommits }) => {
-    broker.broadcast(epoch, tag+'f', encodeData(pedersenPKProve(share, maskShare)))
-    
-    const pks = arrayOf(n)
-    let count = 0
-    broker.receive(epoch, tag+'f', (i, m) => {
-      decodeData(m, pedersenPKDecode, ([ pk, proof ]) => {
-        if (pedersenPKVerify([ pk, proof ], shareCommits[i])) {
-          pks[i] = pk
-          count++
+  const G_ = await consensus.result
+  const i = G_.sort()[0]
+  
+  const A = await As[i]
+  const shares_ = await Promise.all(shares.filter((_, i) => A.includes(i)))
+  
+  share = add(...shares_.map(s => s.share)),
+  maskShare = add(...shares_.map(s => s.maskShare)),
+  skCommit = add(...shares_.map(s => s.skCommit)),
+  shareCommits = arrayOf(n, x => add(...shares_.map(s => s.shareCommits[x])))
+  
+  broker.broadcast(tag+'f', encodeData(pedersenPKProve(share, maskShare)))
+  
+  const pks = arrayOf(n)
+  let count = 0
+  broker.receive(tag+'f', (i, m) => {
+    decodeData(m, pedersenPKDecode, ([ pk, proof ]) => {
+      if (pedersenPKVerify([ pk, proof ], shareCommits[i])) {
+        pks[i] = pk
+        count++
+        
+        if (count >= f+1) {
+          const sharePKs = arrayOf(n, i => pks[i]||interpolate(pks, i+1))
+          const pk = interpolate(pks)
           
-          if (count >= f+1) {
-            const sharePKs = arrayOf(n, i => pks[i]||interpolate(pks, i+1))
-            const pk = interpolate(pks)
-            
-            result.resolve({ share, sharePKs, pk })
-          }
+          result.resolve({ share, sharePKs, pk })
         }
-      })
+      }
     })
   })
   
-  return result
+  return result.promise
 }
 
-function thresholdECDSA(epoch, tag, broker, thresholdShare, m, keyGen) {
+async function thresholdECDSA(tag, broker, sk, pks, msg, keyGen) {
+  const n = broker.n, f = (n-1)/3|0
+  
   function truncateToN(msg, truncOnly) {
-    const delta = msg.byteLength() * 8 - e.n.bitLength()
+    const delta = msg.byteLength() * 8 - ecc.curve.n.bitLength()
     if (delta > 0)
       msg = msg.ushrn(delta)
     if (!truncOnly && msg.cmp(ecc.curve.n) >= 0)
@@ -846,6 +889,9 @@ function thresholdECDSA(epoch, tag, broker, thresholdShare, m, keyGen) {
   }
   
   function toDER(r, s) {
+    r = r.toArray()
+    s = s.toArray()
+    
     function constructLength(arr, len) {
       if (len < 0x80) {
         arr.push(len)
@@ -899,93 +945,115 @@ function thresholdECDSA(epoch, tag, broker, thresholdShare, m, keyGen) {
     return Buffer.from(res).toString('hex')
   }
   
-  async function sign(msg, sk) {
-    const msgHash = truncateToN(new BN(sha512_256(msg), 16))
+  const msgHash = scalar(truncateToN(new BN(sha512_256(msg), 16)))
 
-    // Zero-extend key to provide enough entropy
-    const bytes = ecc.curve.n.byteLength()
-    let bkey = sk.toArray('be', bytes)
+  // Zero-extend key to provide enough entropy
+  const bytes = ecc.curve.n.byteLength()
+  let bkey = sk.val.toArray('be', bytes)
 
-    // Zero-extend nonce to have the same byte size as N
-    const nonce = msgHash.toArray('be', bytes)
+  // Zero-extend nonce to have the same byte size as N
+  const nonce = msgHash.val.toArray('be', bytes)
 
-    // Instantiate Hmac_DRBG
-    const drbg = new HmacDRBG({
-      hash: ecc.curve.hash,
-      entropy: bkey,
-      nonce: nonce,
-      persEnc: 'utf8'
-    })
+  // Number of bytes to generate
+  const ns1 = ecc.curve.n.sub(new BN(1));
 
-    // Number of bytes to generate
-    const ns1 = ecc.curve.n.sub(new BN(1));
-
-    for (let iter = 0; true; iter++) {
-      // Computes kInv by generating shares of a second random secret b, then revealing k*b
-      // and applying the linear function x->x/(k*b) to our share of b.
-      let [ k, kInv ] = await
-        Promise.all([ keyGen(epoch, tag+'n'+iter+'_'), keyGen(epoch, tag+'b'+iter+'_') ])
-        .then(([{ share:k, sharePKs:kSharePKs, pk:kPK },
-               { share:b, sharePKs:bSharePKs, pk:bPK }]) => {
-        const result = defer()
-        const kbShare = k.mul(b), proof = chaumPedersenProve(k, bSharePKs[broker.thisHostIndex])
-        broker.broadcast(epoch, tag+'r'+iter, encodeData([ kbShare, proof ]))
-        
-        const kbShares = arrayOf(n)
-        let count = 0
-        broker.receive(epoch, tag+'r'+iter, (i, m) => {
-          decodeData(m, ['S', chaumPedersenDecode], ([ kbShare, proof ]) => {
-            if (chaumPedersenVerify(kSharePKs[i], bSharePKs[i], proof) &&
-                proof[0].equals(kbShare.mul(G))) {
-              kbShares[i] = kbShare
-              count++
-              
-              if (count >= 2*f+1) {
-                result.resolve([ k, b.div(interpolate(kbShares)) ])
-              }
+  for (let iter = 0; true; iter++) {
+    // Computes kInv by generating shares of a second random secret b, then revealing k*b
+    // and applying the linear function x->x/(k*b) to our share of b.
+    const kAndKInv = defer()
+    {
+      const [{ share:k, sharePKs:kSharePKs, pk:kPK }, { share:b, sharePKs:bSharePKs, pk:bPK }] =
+        await Promise.all([ keyGen(tag+'n'+iter+'_', broker), keyGen(tag+'b'+iter+'_', broker) ])
+      
+      const kbShare = k.mul(b), proof = chaumPedersenProve(k, bSharePKs[broker.thisHostIndex])
+      broker.broadcast(tag+'r'+iter, encodeData([ kbShare, proof ]))
+      
+      const kbShares = arrayOf(n)
+      let count = 0, finished = false
+      broker.receive(tag+'r'+iter, (i, m) => {
+        if (finished) return;
+        console.error('received r'+i+': ' + m)
+        decodeData(m, ['S', chaumPedersenDecode], ([ kbShare, proof ]) => {
+          if (chaumPedersenVerify(kSharePKs[i], bSharePKs[i], proof) &&
+              proof[0].equals(kbShare.mul(G))) {
+            console.error('verified r'+i+': ' + m)
+            kbShares[i] = kbShare
+            count++
+            
+            if (count === 2*f+1) {
+              const kb = interpolate(kbShares)
+              if (kb.val.fromRed().cmpn(0) === 0) kAndKInv.resolve([ ])
+              else kAndKInv.resolve([ k, b.div(kb), bSharePKs.map(pk => pk.div(kb)), kPK ])
+              finished = true
             }
-          })
+          }
         })
-        
-        return result
       })
-      
-      k = k.val.fromRed()
-      kInv = kInv.val.fromRed()
-      
-      if (k.cmpn(1) <= 0 || k.cmp(ns1) >= 0)
-        continue;
-
-      const kp = kPK
-      if (kp.isInfinity())
-        continue;
-
-      const kpX = kp.getX()
-      const r = kpX.umod(ecc.curve.n)
-      if (r.cmpn(0) === 0)
-        continue;
-
-      let s = kInv.mul(r.mul(sk).iadd(msgHash))
-      s = s.umod(ecc.curve.n)
-      if (s.cmpn(0) === 0)
-        continue;
-
-      let recoveryParam = (kp.getY().isOdd() ? 1 : 0) |
-                          (kpX.cmp(r) !== 0 ? 2 : 0)
-
-      // Use complement of `s`, if it is > `n / 2`
-      if (s.cmp(ecc.curve.nh) > 0) {
-        s = ecc.curve.n.sub(s)
-        recoveryParam ^= 1
-      }
-
-      return toDer(r, s)
     }
+    
+    let [ k, kInv, kInvSharePKs, kPK ] = await kAndKInv.promise
+    console.error('constructed k')
+    
+    if (!k) continue;
+
+    const kpX = kPK.val.getX()
+    const r = scalar(kpX.umod(ecc.curve.n))
+    if (r.val.cmpn(0) === 0) continue;
+    
+    const sShare = kInv.mul(r.mul(sk).add(msgHash))
+    
+    const sp = defer()
+    {
+      const proof = chaumPedersenProve(sk, kInvSharePKs[broker.thisHostIndex])
+      broker.broadcast(tag+'s'+iter, encodeData([ sShare, proof ]))
+      
+      const sShares = arrayOf(n)
+      let count = 0, finished = false
+      broker.receive(tag+'s'+iter, (i, m) => {
+        if (finished) return;
+        console.error('received s'+i+': ' + m)
+        decodeData(m, ['S', chaumPedersenDecode], ([ sShare, proof ]) => {
+          if (chaumPedersenVerify(pks[i], kInvSharePKs[i], proof) &&
+              proof[0].mul(r).add(kInvSharePKs[i].mul(msgHash))
+                .equals(sShare.mul(G))) {
+            console.error('verified s'+i+': ' + m)
+            sShares[i] = sShare
+            count++
+            
+            if (count >= 2*f+1) {
+              sp.resolve(interpolate(sShares))
+              finished = true
+            }
+          }
+        })
+      })
+    }
+    
+    let s = (await sp.promise).val.fromRed()
+    console.error('constructed s')
+    
+    if (s.cmpn(0) === 0)
+      continue;
+
+    let recoveryParam = (kPK.val.getY().isOdd() ? 1 : 0) |
+                        (kpX.cmp(r) !== 0 ? 2 : 0)
+
+    // Use complement of `s`, if it is > `n / 2`
+    if (s.cmp(ecc.nh) > 0) {
+      s = ecc.curve.n.sub(s)
+      recoveryParam ^= 1
+    }
+
+    console.error(r.val.fromRed())
+    console.error(s)
+
+    return toDER(r.val.fromRed(), s)
   }
 }
 
 module.exports = {
   setupHeavyCommonCoin,
   setupCommonCoin,
-  keyGenAsync
+  keyGenAsync,
+  thresholdECDSA
 }

@@ -57,7 +57,7 @@ function RWebSocket(thisHostIndex, target, peerName, skey, onAddDhKey) {
           if (d >= maxd) {
             console.log('\x1b[31m%s\x1b[0m', 'connection to ' + peerName + ' timed out. reconnecting...')
             open = false
-            maxd *= 1.5
+            maxd *= 2
             while (hist.find(e => e.isConnectionEvent)) {
               hist.splice(hist.findIndex(e => e.isConnectionEvent), 1)
             }
@@ -68,10 +68,10 @@ function RWebSocket(thisHostIndex, target, peerName, skey, onAddDhKey) {
             let exceeded = false
             hist.forEach(e => {
               if (!e.closed) {
-                if (e.executionCount > 0) exceeded = true
-                e.executionCount++
+                if (e.executionCount > 1) exceeded = true
+                if (e.executionCount > 0) e.execute()
                 
-                e.execute()
+                e.executionCount++
               }
             })
 
@@ -98,6 +98,7 @@ function RWebSocket(thisHostIndex, target, peerName, skey, onAddDhKey) {
         }
         
         hist.push(e)
+        execute()
         
         return e.index
       },
@@ -116,7 +117,7 @@ function RWebSocket(thisHostIndex, target, peerName, skey, onAddDhKey) {
         
         avg = closedHist.reduce((s, _e) => s + _e.totalTime) / closedHist.length
         if (closedHist.length >= 50) {
-          d = Math.min((10*maxd + avg) / 11, d)
+          d = Math.min((10*maxd + 2*avg) / 11, d)
           maxd = Math.min((50*maxd + d*10) / 51, maxd)
         }
       },
@@ -181,11 +182,10 @@ function RWebSocket(thisHostIndex, target, peerName, skey, onAddDhKey) {
   function ping(back, ws) {
     setTimeout(() => {
       if (back.connected) {
-        console.log('pinging init')
-        pings.push(back.createEvent(() => { ws.send('_ping'); console.log('pinging again') }))
+        pings.push(back.createEvent(() => { ws.send('_ping') }))
       }
       ping(back, ws)
-    }, 30000)
+    }, 300000)
   }
   
   let ws = { send: m => { } }, sendQueue = new Map()
@@ -201,8 +201,14 @@ function RWebSocket(thisHostIndex, target, peerName, skey, onAddDhKey) {
         let e = sendQueue.get(ack)
         sendQueue.delete(ack)
         back.closeEvent(e)
+      } else if (command === '_ackAll') {
+        sendQueue = sendQueue.filter((e, key) => {
+          if (key.startsWith(ack)) {
+            back.closeEvent(e)
+            return false
+          } else return true
+        })
       } else if (command === '_pong') {
-        console.log('received pong')
         pings.forEach(e => back.closeEvent(e))
         pings.splice(0, pings.length)
       }
@@ -211,14 +217,21 @@ function RWebSocket(thisHostIndex, target, peerName, skey, onAddDhKey) {
   
   ping(back, ws)
   
+  const sentMMMM = new Map()
+  
   return {
-    send: (epoch, tag, m) => {
-      const encMes = '_mes ' + epoch.length + ' ' + tag.length + ' ' + epoch + tag + m
-      sendQueue.set(epoch.length + ' ' + epoch + tag, back.createEvent(() => { ws.send(encMes); console.log('sending ' + epoch + ' ' +tag) }))
+    send: (tag, m) => {
+      if (sentMMMM.has(tag)) throw new Error('wtf at ' + tag)
+      sentMMMM.set(tag, '')
+      
+      const encMes = '_mes ' + tag.length + ' ' + tag + m
+      sendQueue.set(tag, back.createEvent(() => { ws.send(encMes) }))
     },
-    clearEpoch: epoch => sendQueue.forEach((_, key) => {
-      if (key.startsWith(epoch.length + ' ' + epoch)) sendQueue.delete(key)
-    })
+    clearEpoch: tag => {
+      sendQueue.forEach((_, key) => {
+        if (key.startsWith(tag)) setTimeout(() => sendQueue.delete(key), 600000)
+      })
+    }
   }
 }
 
@@ -228,10 +241,17 @@ function RWebSocketServer(port, n, skey, pkey, usernames, dhkeys) {
   const server = new WebSocket.Server({ port })
   let messageListeners = new Map()
   const connectedD = [...Array(n)].map(_ => defer())
-  let pingedRecently = false
 
+  const unhandledMessageStacks = [...Array(n)].map(_ => [ ]),
+        unhandledMessageStacksLengths = [...Array(n)].map(_ => 0)
+  
   server.on('connection', soc => {
     let authedAs = -1
+    setTimeout(() => {
+      if (authedAs === -1) soc.close()
+    }, 60000)
+    
+    let recentPings = 0
   
     soc.on('message', data => {
       const [ command, ...params ] = data.split(' ')
@@ -265,28 +285,36 @@ function RWebSocketServer(port, n, skey, pkey, usernames, dhkeys) {
         }
       } else {
         if (command === '_mes') {
-          const epochLength = parseInt(params[0], 10), 
-                tagLength = parseInt(params[1], 10),
-                taggedMes = params.slice(2).join(' ')
-          const epoch = taggedMes.slice(0, epochLength)
-          const tag = taggedMes.slice(epochLength, epochLength + tagLength)
-          const m = taggedMes.slice(epochLength + tagLength)
-          const epochTag = epochLength + ' ' + epoch + tag
+          const tagLength = parseInt(params[0], 10),
+                taggedMes = params.slice(1).join(' ')
+          const tag = taggedMes.slice(0, tagLength)
+          const m = taggedMes.slice(tagLength)
           
-          if (messageListeners.has(epochTag)) {
-            console.log('message accepted from ' + authedAs + ' at [' + epoch + ', ' + tag + ']: ' + m)
-            soc.send('_ack ' + epochTag, err => { })
-            if (messageListeners.get(epochTag)(authedAs, m)) {
-              setTimeout(() => messageListeners.delete(epochTag), 60000)
+          if (messageListeners.has(tag)) {
+            console.log('message accepted from ' + authedAs + ' at [' + tag + ']: ' + m)
+            soc.send('_ack ' + tag, err => { })
+            if (messageListeners.get(tag)(authedAs, m)) {
+              setTimeout(() => messageListeners.delete(tag), 60000)
             }
           } else {
-            console.log('message rejected from ' + usernames[authedAs] + ' at [' + epoch + ', ' + tag + ']: ' + m)
+            if (unhandledMessageStacks[authedAs].some(([tag_]) => tag === tag_)) {
+              soc.send('_ack ' + tag, err => { })
+              return;
+            }
+            
+            if (unhandledMessageStacksLengths[authedAs] <= 1000000-m.length-tagLength
+                && unhandledMessageStacks[authedAs].length <= 1000) {
+              unhandledMessageStacks[authedAs].push([tag, m])
+              unhandledMessageStacksLengths[authedAs] += tagLength+m.length
+              soc.send('_ack ' + tag, err => { })
+            } else {
+              console.log('message rejected from ' + usernames[authedAs] + ' at [' + m_[0] + ']: ' + m_[1])
+            }
           }
-        } else if (command === '_ping' && !pingedRecently) {
-          console.log('ponging')
+        } else if (command === '_ping' && recentPings < 10) {
           soc.send('_pong', err => { })
-          //pingedRecently = true
-          //setTimeout(() => pingedRecently = false, 5000)
+          recentPings++
+          setTimeout(() => recentPings--, 30000)
         }
       }
     })
@@ -294,24 +322,37 @@ function RWebSocketServer(port, n, skey, pkey, usernames, dhkeys) {
 
   return {
     connected: connectedD.map(d => d.promise),
-    onMessage: (epoch, tag, cb) => {
-      const epochTag = epoch.length + ' ' + epoch + tag
+    onMessage: (tag, cb) => {
       const recd = [...Array(n)].map(_ => false)
-      let termed = false
-      const listener = (i, m) => {
-        if (termed || recd[i]) return;
-        termed = cb(i, m)
+      let listener
+      const listener_ = (i, m) => {
+        if (recd[i]) return;
+        cb(i, m)
         
         recd[i] = true
-        return termed || recd.every(t => t)
+        return recd.every(t => t)
       }
       
-      messageListeners.set(epochTag, listener)
+      if (messageListeners.has(tag)) {
+        const oldCB = messageListeners.get(tag)
+        listener = (i, m) => {
+          const a = oldCB(i, m)
+          const b = listener_(i, m)
+          return a && b
+        }
+      } else listener = listener_
+      
+      messageListeners.set(tag, listener)
+      
+      let heldMessages = unhandledMessageStacks.map(stack => 
+        stack.find(([tag_]) => tag_ === tag))
+      
+      heldMessages.forEach((e, i) => { if (e) listener(i, e[1]) })
     },
-    onMessageFrom: (epoch, tag, sender, cb) => {
-      const epochTag = epoch.length + ' ' + epoch + tag
+    onMessageFrom: (tag, sender, cb) => {
       let recd = false
-      const listener = (i, m) => {
+      let listener
+      const listener_ = (i, m) => {
         if (i === sender && !recd) {
           cb(m)
           recd = true
@@ -319,11 +360,27 @@ function RWebSocketServer(port, n, skey, pkey, usernames, dhkeys) {
         }
       }
       
-      messageListeners.set(epochTag, listener)
+      if (messageListeners.has(tag)) {
+        const oldCB = messageListeners.get(tag)
+        listener = (i, m) => {
+          const a = oldCB(i, m)
+          const b = listener_(i, m)
+          return a && b
+        }
+      } else listener = listener_
+      
+      messageListeners.set(tag, listener)
+      
+      let heldMessages = unhandledMessageStacks.map(stack => 
+        stack.find(([tag_]) => tag_ === tag))
+      
+      heldMessages.forEach((e, i) => { if (e) listener(i, e[1]) })
     },
-    clearEpoch: epoch => messageListeners.forEach((_, key) => {
-      if (key.startsWith(epoch.length + ' ' + epoch)) messageListeners.delete(key)
-    })
+    clearEpoch: tag => {
+      messageListeners.forEach((_, key) => {
+        if (key.startsWith(tag)) setTimeout(() => messageListeners.delete(key), 600000)
+      })
+    }
   }
 }
 
@@ -364,11 +421,12 @@ module.exports = function getBroker() {
   const server = RWebSocketServer(process.env.PORT, n, skey, pkey, usernames, dhkeys)
   
   return {
-    broadcast: (epoch, tag, m) => outSocs.forEach(soc => soc.send(''+epoch, ''+tag, m)),
-    send: (epoch, tag, mFunc) => outSocs.forEach((soc,i) => soc.send(''+epoch, ''+tag, mFunc(i))),
-    sendTo: (epoch, tag, i, m) => outSocs[i].send(''+epoch, ''+tag, m),
-    receive: (epoch, tag, cb) => server.onMessage(''+epoch, ''+tag, cb),
-    receiveFrom: (epoch, tag, i, cb) => server.onMessageFrom(''+epoch, ''+tag, i, cb),
+    broadcast: (tag, m) => outSocs.forEach(soc => soc.send(''+tag, m)),
+    send: (tag, mFunc) => outSocs.forEach((soc,i) => soc.send(''+tag, mFunc(i))),
+    sendTo: (tag, i, m) => outSocs[i].send(''+tag, m),
+    receive: (tag, cb) => server.onMessage(''+tag, cb),
+    receiveFrom: (tag, i, cb) => server.onMessageFrom(''+tag, i, cb),
+    clearEpoch: tag => { server.clearEpoch(tag); outSocs.forEach(soc => soc.clearEpoch(tag)) },
     allConnected: Promise.all(server.connected).then(() => undefined),
     kConnected: k => {
       const ret = defer()
