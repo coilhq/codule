@@ -58,8 +58,8 @@ module.exports = async function () {
   const { share:sk, sharePKs:pks, pk } = 
     await keyGenAsync('tagABC', broker, brachaBroadcast, brachaReceive, setupConsensus)
   
-  console.error(sk.val)
-  console.error(pk.val)
+  console.error('secret key share: ' + sk.val.toString('hex'))
+  console.error('public key: ' + pk.val.encodeCompressed('hex'))
   
   const setupFastConsensus = async (tag, broker) => {
     const coin = await setupCommonCoin(tag+'hcc', broker, sk, pks)
@@ -86,16 +86,14 @@ module.exports = async function () {
     
     return {
       vote:yesVotes => {
-        ;[...Array(n)].forEach((_, i) => ABBAs[i].vote(yesVotes.includes(i)))
+        ABBAs.forEach((ABBA, i) => { ABBA.vote(yesVotes.includes(i)) })
       },
       result:Promise.all(ABBAs.map(c => c.result)).then(results => results.filter(t => t))
     }
   }
   
   const keyGen = (tag, broker) => {
-    let kg = keyGenAsync(tag, broker, brachaBroadcast, brachaReceive, setupFastConsensus)
-    kg.then(result => console.error('HAHAHAHAHAHAHA ' + tag))
-    return kg
+    return keyGenAsync(tag, broker, brachaBroadcast, brachaReceive, setupFastConsensus)
   }
   
   let iteration = 0
@@ -107,4 +105,4 @@ module.exports = async function () {
 
 // const setupSigning = require('./index.js')
 // let sign; setupSigning().then(s => sign = s)
-// sign('bye').then(sig => console.error(sig))
+// sign('bye').then(sig => console.error('signature: ' + sig))

@@ -770,8 +770,6 @@ async function setupHeavyCommonCoin(tag, broker, reliableBroadcast, reliableRece
   const { Z, G, As, shares:keys }
     = await setupKeygenProposalsStable(tag+'s', broker, reliableBroadcast, reliableReceive)
   
-  console.error(keys)
-  
   const Akeys = arrayOf(n, i => As[i] && ({
     share: add(...As[i].map(j => keys[j].share)),
     maskShare: add(...As[i].map(j => keys[j].maskShare)),
@@ -845,12 +843,13 @@ async function keyGenAsync(tag, broker, reliableBroadcast, reliableReceive, setu
   const i = G_.sort()[0]
   
   const A = await As[i]
+  
   const shares_ = await Promise.all(shares.filter((_, i) => A.includes(i)))
   
-  share = add(...shares_.map(s => s.share)),
-  maskShare = add(...shares_.map(s => s.maskShare)),
-  skCommit = add(...shares_.map(s => s.skCommit)),
-  shareCommits = arrayOf(n, x => add(...shares_.map(s => s.shareCommits[x])))
+  const share = add(...shares_.map(s => s.share))
+  const maskShare = add(...shares_.map(s => s.maskShare))
+  const skCommit = add(...shares_.map(s => s.skCommit))
+  const shareCommits = arrayOf(n, x => add(...shares_.map(s => s.shareCommits[x])))
   
   broker.broadcast(tag+'f', encodeData(pedersenPKProve(share, maskShare)))
   
@@ -963,7 +962,8 @@ async function thresholdECDSA(tag, broker, sk, pks, msg, keyGen) {
     const kAndKInv = defer()
     {
       const [{ share:k, sharePKs:kSharePKs, pk:kPK }, { share:b, sharePKs:bSharePKs, pk:bPK }] =
-        await Promise.all([ keyGen(tag+'n'+iter+'_', broker), keyGen(tag+'b'+iter+'_', broker) ])
+        await Promise.all([ keyGen(tag+'n'+iter+'_', broker),
+                            keyGen(tag+'b'+iter+'_', broker) ])
       
       const kbShare = k.mul(b), proof = chaumPedersenProve(k, bSharePKs[broker.thisHostIndex])
       broker.broadcast(tag+'r'+iter, encodeData([ kbShare, proof ]))
@@ -972,11 +972,9 @@ async function thresholdECDSA(tag, broker, sk, pks, msg, keyGen) {
       let count = 0, finished = false
       broker.receive(tag+'r'+iter, (i, m) => {
         if (finished) return;
-        console.error('received r'+i+': ' + m)
         decodeData(m, ['S', chaumPedersenDecode], ([ kbShare, proof ]) => {
           if (chaumPedersenVerify(kSharePKs[i], bSharePKs[i], proof) &&
               proof[0].equals(kbShare.mul(G))) {
-            console.error('verified r'+i+': ' + m)
             kbShares[i] = kbShare
             count++
             
@@ -992,7 +990,6 @@ async function thresholdECDSA(tag, broker, sk, pks, msg, keyGen) {
     }
     
     let [ k, kInv, kInvSharePKs, kPK ] = await kAndKInv.promise
-    console.error('constructed k')
     
     if (!k) continue;
 
@@ -1011,12 +1008,10 @@ async function thresholdECDSA(tag, broker, sk, pks, msg, keyGen) {
       let count = 0, finished = false
       broker.receive(tag+'s'+iter, (i, m) => {
         if (finished) return;
-        console.error('received s'+i+': ' + m)
         decodeData(m, ['S', chaumPedersenDecode], ([ sShare, proof ]) => {
           if (chaumPedersenVerify(pks[i], kInvSharePKs[i], proof) &&
               proof[0].mul(r).add(kInvSharePKs[i].mul(msgHash))
                 .equals(sShare.mul(G))) {
-            console.error('verified s'+i+': ' + m)
             sShares[i] = sShare
             count++
             
@@ -1030,7 +1025,6 @@ async function thresholdECDSA(tag, broker, sk, pks, msg, keyGen) {
     }
     
     let s = (await sp.promise).val.fromRed()
-    console.error('constructed s')
     
     if (s.cmpn(0) === 0)
       continue;
@@ -1043,9 +1037,6 @@ async function thresholdECDSA(tag, broker, sk, pks, msg, keyGen) {
       s = ecc.curve.n.sub(s)
       recoveryParam ^= 1
     }
-
-    console.error(r.val.fromRed())
-    console.error(s)
 
     return toDER(r.val.fromRed(), s)
   }

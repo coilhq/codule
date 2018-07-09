@@ -148,16 +148,18 @@ function setupMostefaouiConsensus(tag, broker, coin) {
         let auxed = false, voted = [ false, false ]
         
         broker.broadcast(tag+'b'+i+'_'+vote, voteName)
+        voted[vote] = true
         
         const bin_values = [ defer(), defer() ]
-        receive(tag+'b'+i+'_'+(1-vote), broker)
-          .onCountMatching(f+1, (m) => {
-            broker.broadcast(tag+'b'+i+'_'+(1-vote), m)
-          })
-          .digest()
           
         ;([0, 1]).forEach(async (j) => {
           receive(tag+'b'+i+'_'+j, broker)
+            .onCountMatching(f+1, (m) => {
+              if (!voted[j]) {
+                broker.broadcast(tag+'b'+i+'_'+j, m)
+                voted[j] = true
+              }
+            })
             .onCountMatching(n-f, (m) => {
               if (!auxed) {
                 broker.broadcast(tag+'a'+i, ''+j)
