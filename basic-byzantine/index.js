@@ -108,9 +108,10 @@ function brachaReceive(tag, sender, broker, parseInput = m => m, didntEcho) {
   return result.promise
 }
 
-// Cut down version of Moustefaoui et al.'s updated binary consensus. For some reason
-// the updated algorithm makes the round function twice as long as it needs to be;
-// a single DSBV instance per round suffices.
+// Cut down version of Moustefaoui et al.'s updated binary consensus. Instead of
+// using two DSBV instances, we use a variant of DSBV with a conf round implanted
+// between the two SBV instances, reducing the number of messages per round from
+// 8 to 5.
 function setupMostefaouiConsensus(tag, broker, coin) {
   const n = broker.n, f = (n-1)/3|0
   let result = defer()
@@ -143,9 +144,9 @@ function setupMostefaouiConsensus(tag, broker, coin) {
     for (let i = 0; !finished; i++) {
       const roundResult = defer()
       
-      function SBV(tag, vote, voteName) {
+      function SBV(tag, vote, voteName, shouldConf) {
         const SBVResult = defer()
-        let auxed = false, voted = [ false, false ]
+        let auxed = false, voted = [ false, false ], confd = false
         
         broker.broadcast(tag+'b'+i+'_'+vote, voteName)
         voted[vote] = true
@@ -175,6 +176,19 @@ function setupMostefaouiConsensus(tag, broker, coin) {
           receive(tag+'a'+i, broker)
             .suchThat((i, m) => m === ''+j)
             .onCount(n-f, () => {
+              if (!shouldConf) SBVResult.resolve([j, jName])
+              else {
+                if (!confd) {
+                  broker.broadcast(tag+'c'+i, ''+j)
+                  confd = true
+                }
+              }
+            })
+            .digest()
+          
+          receive(tag+'c'+i, broker)
+            .suchThat((i, m) => m === ''+j)
+            .onCount(n-f, () => {
               SBVResult.resolve([j, jName])
             })
             .digest()
@@ -184,6 +198,18 @@ function setupMostefaouiConsensus(tag, broker, coin) {
           .then((zeroName, oneName) => {
           receive(tag+'a'+i, broker)
             .onCount(n-f, () => {
+              if (!shouldConf) SBVResult.resolve([2, zeroName, oneName])
+              else {
+                if (!confd) {
+                  broker.broadcast(tag+'c'+i, '2')
+                  confd = true
+                }
+              }
+            })
+            .digest()
+          
+          receive(tag+'c'+i, broker)
+            .onCount(n-f, () => {
               SBVResult.resolve([2, zeroName, oneName])
             })
             .digest()
@@ -192,8 +218,9 @@ function setupMostefaouiConsensus(tag, broker, coin) {
         return SBVResult.promise
       }
       
-      const [ mid ] = await SBV(tag+'1', est_i, '')
-      const [ final, zeroName ] = await SBV(tag+'2', (mid === 2) ? 1 : 0, (mid !== 2) ? ''+mid : '')
+      const [ mid ] = await SBV(tag+'1', est_i, '', i > 5)
+      const [ final, zeroName ] = 
+        await SBV(tag+'2', (mid === 2) ? 1 : 0, (mid === 2) ? '2' : ''+mid)
       
       const v = parseInt(zeroName)
       if (final === 0) {
