@@ -261,50 +261,61 @@ AVSSG.precompute()
 
 // ------------------- Merkle tree manipulation functions -------------------------
 
-// NOTE currently all merkle tree code is unused
-
-function pathToLeaf(leaf, treeDepth) {
+// array of bits (0=left, 1=right) indicating how to descend from root to a given leaf index
+function pathToLeaf_(leaf, treeDepth) {
   return arrayOf(treeDepth, i => (leaf >> (treeDepth-1-i)) % 2)
 }
 
-function depth(num) {
+// depth of a tree with num leaves
+function depth_(num) {
   let d = 0
   while ((num-1 >> d) > 0) d++
   
   return d
 }
 
-function roundUpPow2(num) {
-  return (1 << depth(num))
+// num leaves in a full tree of the same height
+function roundUpPow2_(num) {
+  return (1 << depth_(num))
 }
 
-function merkleConstruct_(data) {
-  const paddedData = data.concat(arrayOf(roundUpPow2(data.length)-data.length, () => ''))
-  
+// paddedData should always be a power of 2
+function merkleConstruct_(paddedData) {
   if (data.length > 1) {
     const lnode = merkleConstruct_(paddedData.slice(0, paddedData.length/2)),
           rnode = merkleConstruct_(paddedData.slice(paddedData.length/2, paddedData.length))
     
-    return [ 'N'+hashToStr(lnode[0]+' '+rnode[0]), lnode, rnode ]
-  } else return [ 'L'+hashToStr(JSON.stringify(data[0])) ]
+    return [ 'node||'+hashToStr(lnode[0]+'| |'+rnode[0]), lnode, rnode ]
+  } else if (data[0] === 'empty leaf') {
+    return [ 'empty leaf||'+hashToStr('empty leaf') ]
+  } else return [ 'leaf||'+hashToStr(JSON.stringify(data[0])) ]
 }
 
-function merkleBranch(tree, depth, leaf) {
-  const side = pathToLeaf(leaf, depth)[0]
+// returns a list (ordered bottom -> root) of hashes of neighboring nodes on the branch from the given leaf
+// TODO memoization might be good
+function merkleBranch_(tree, depth, leaf) {
+  const side = pathToLeaf_(leaf, depth)[0]
   if (depth > 0)
-    return [ ...merkleBranch(tree[1+side], depth-1, leaf - (side << (depth-1))), tree[2-side][0] ]
+    return [ ...merkleBranch_(tree[1+side], depth-1, leaf - (side << (depth-1))), tree[2-side][0] ]
   else
     return [ ]
 }
 
+// builds the actual Merkle tree over our data, returns a function to pull branches from it
 function merkleConstruct(data) {
-  const tree = merkleConstruct_(data)
-  return { root:tree[0], tree, branch:(leaf) => merkleBranch(tree, depth(data.length), leaf) }
+  // for simplicity we use padded Merkle trees to avoid complications from unbalanced trees
+  const paddedData = data.concat(arrayOf(roundUpPow2_(data.length)-data.length, () => 'empty leaf'))
+  
+  const tree = merkleConstruct_(paddedData)
+  return { root:tree[0].slice(6), branch:(leaf) => merkleBranch_(tree, depth_(data.length), leaf) }
 }
 
+// verify that datum was in the tree under root, and wasn't a padding leaf
 function merkleBranchVerify(leaf, datum, branch, root) {
-  const pathFromLeaf = pathToLeaf(leaf, branch.length).reverse()
-  return branch.reduce((acc, sideHash, i) => 'N'+hashToStr(pathFromLeaf[i] ? (sideHash+' '+acc) : (acc+' '+sideHash)), 'L'+hashToStr(JSON.stringify(datum))) === root
+  const pathFromLeaf = pathToLeaf_(leaf, branch.length).reverse()
+  return branch.reduce((acc, sideHash, i) => {
+    return 'node||'+hashToStr(pathFromLeaf[i] ? (sideHash+'| |'+acc) : (acc+'| |'+sideHash))
+  }, 'leaf||'+hashToStr(JSON.stringify(datum))) === 'node||'+root
 }
 
 // ------------------- Zero-knowedge proofs -------------------------
@@ -438,10 +449,12 @@ function pedersenPKVerify([ pk, [ mask, sig ] ], commitment) {
 
 // ---------------------------------------------------------------
 
+// evaluates the polynomial input p at evalPoint
 function polyEval(constTerm, coeffs, evalPoint) {
   return add(constTerm, ...coeffs.map((c, j) => c.mul(evalPoint.toThe(scalar(j+1)))))
 }
 
+// returns a function mapping a node index to p(i+1)
 function polyEvalPlayer(constTerm, coeffs) {
   return i => polyEval(constTerm, coeffs, scalar(i+1))
 }
@@ -454,9 +467,14 @@ function secretShare(sk, t, n) {
   return { shares, coeffs }
 }
 
+// evaluate at x_ the lowest-degree polynomial interpolating shares_
+// shares_ is formatted as an array where shares_[i] is expected to be truth-y iff
+// (i, shares_[i]) is an x-y pair to be interpolated.
 function interpolate(shares_, x_ = 0) {
   const shares = shares_.reduce((acc, s, i) => { if (s) acc.push([i+1, s]); return acc }, [ ])
   const x = scalar(x_)
+  
+  // the values being interpolated can either be scalars or elliptic curve points
   let typeOfShares = (shares[0][1].isScalar) ? scalar : point
 
   return shares.reduce((sacc, [i_, share]) => {
@@ -484,27 +502,26 @@ function AVSSDeal(tag, sk, broker, reliableBroadcast, t) {
   const n = broker.n, f = (n - 1)/3|0
   t = t||f+1
   
-  const pk = sk.mul(AVSSG)
   // coeffs is a polynomial p of degree t-1, and shares[i] = p(i+1)
   const { shares:shares, coeffs:coeffs } = secretShare(sk, t, n)
-  const pubCoeffs = coeffs.map((coeff, i) => coeff.mul(AVSSG))
   
   // for each secret share s_i, produces a polynomial p_i of degree f, then slices
-  // the shares of these polynomials so that subShares[i][j] = p_j(i+1), subCoeffs[i] = p_i.
+  // the shares of these polynomials so that subShares[i][j] = p_i(j+1), subCoeffs[i] = p_i.
   const { subShares, subCoeffs } = shares.map((s, i) => secretShare(s, f+1, n))
                                          .reduce(({ subShares, subCoeffs }, { shares, coeffs }) => {
-                                           shares.forEach((s, i) => subShares[i].push(s))
-                                           subCoeffs.push(coeffs)
-
-                                           return { subShares, subCoeffs }
-                                         }, { subShares:arrayOf(n, () => [ ]), subCoeffs:[ ] })
+                                           return { subShares+shares, subCoeffs+coeffs }
+                                         }, { subShares:[ ], subCoeffs:[ ] })
   
-  const pubSubCoeffs = subCoeffs.map((arr, i) => arr.map((coeff, j) => coeff.mul(AVSSG)))
+  // subShareSlices[i][j] = p_j(i+1), so that seeing subShareSlices[_][j] for enough values
+  // allows you to interpolate p_j.
+  const subShareSlices = arrayOf(n, i => arrayOf(n, j => subShares[j][i]))
+  const pubSubShares = subShares.map(arr => arr.map(share => share.mul(AVSSG)))
 
-  // reliably broadcast all the public verification keys and to each node send its shares and subshares.
-  const mFunc = i => encodeData([ shares[i], subShares[i],
-                                  pk, pubCoeffs, pubSubCoeffs ])
-  reliableBroadcast(tag, mFunc, broker)
+  // reliably broadcast all the public verification keys and to each node send its subshares.
+  // we don't need to send the actual shares because they will be reconstructed from other
+  // nodes' subshares. similarly, pk and pubCoeffs are derived from pubSubCoeffs.
+  const mFunc = i => encodeData([ subShareSlices[i], pubSubShares ])
+  broker.send(tag+'i', mFunc)
   
   // short hash committing to the public verification keys
   return hashToStr(encodeData([ pk, pubCoeffs, pubSubCoeffs ]))
@@ -514,9 +531,113 @@ function AVSSReceive(tag, sender, broker, reliableReceive, t) {
   const n = broker.n, f = (n - 1)/3|0
   t = t||f+1
   const result = defer(), didntEcho = defer(), shouldRecover = defer(), recoveredValue = defer()
-  let recovered = false
+  let echoed = false, readied = false, recovered = false
   
-  let share, subShares, pk, pubCoeffs, pubSubCoeffs, h
+  let share, pk, pubCoeffs, pubSubCoeffs, h, tree
+  
+  
+  
+  
+  let result = defer(), echoesReceived = arrayOf(n)
+  
+  broker.receiveFrom(tag+'i', sender, m => {
+    if (!echoed) {
+      echoed = true
+      
+      decodeData(m, [ arrayOf(n, _ => 'S'), arrayOf(n, _ => arrayOf(n, _ => 'P'))], 
+        ([ subShareSlice, pubSubShares ]) => {        
+        // check that the polynomial interpolating pubSubShares[i] has degree at most f for all i.
+        //
+        // this works because two distinct small-degree polynomials are only equal on a negligible number
+        // of points, and interpolated polynomials always have small degree.
+        // thus if the first interpolated value equals the second, then with overwhelming probability
+        // the polynomial interpolating pubSubShares[i] is the same as the polynomial interpolating the first
+        // f+1 shares, which has degree at most f.
+        let randPoint = genSk()
+        if (!pubSubShares.every((pubSubShare, i) => {
+          let fullPolyAtRandPoint = interpolate(pubSubShare, randPoint)
+          let degreeLessThanTPolyAtRandPoint = interpolate(pubSubShare.map((s,i) => (i<f+1) ? s : false), randPoint)
+          return (fullPolyAtRandPoint === degreeLessThanTPolyAtRandPoint)
+        }) return;
+        
+        let pubShares = pubSubShares.map(pubSubShare => interpolate(pubSubShare))
+        
+        // check that the polynomial interpolating pubShares has degree at most t-1.
+        let fullPolyAtRandPoint = interpolate(pubShares, randPoint)
+        let degreeLessThanTPolyAtRandPoint = interpolate(pubShares.map((s,i) => (i<t) ? s : false), randPoint)
+        if (fullPolyAtRandPoint !== degreeLessThanTPolyAtRandPoint)
+          return;
+        
+        // check all our subshares are valid evaluations of the polys committed to under pubSubCoeffs
+        if (!subShareSlice.every((subShare, i) => subShare.mul(AVSSG).equals(pubSubShares[i][broker.thisHostIndex])))
+          return;
+        
+        pk = interpolate(pubShares)
+        
+        // build a Merkle tree over all the verification keys for all subshares.
+        tree = merkleConstruct(pubSubShares.reduce((acc, arr) => acc+arr.map(p => p.encodeStr()), []))
+        
+        // send every node our subShare of their share, along with a merkle proof for it.
+        const mFunc = i => encodeData([ subShares[i], pk, pubShares, tree.root, tree.branch(i*n+broker.thisHostIndex) ])
+        broker.send(tag+'e', mFunc)
+      })
+    }
+  })
+  
+  broker.receive(tag+'e', (i, m) => {
+    decodeData(m, [ 'S', 'P', arrayOf(n, _ => 'P'), 'T', arrayOf(depth_(n*n), _ => 'T')], 
+      ([ subShare, pk, pubShares, root, branch ]) => {
+      pubSubShare = subShare.mul(AVSSG)
+      if (!merkleBranchVerify(broker.thisHostIndex*n + i, pubSubShare.encodeStr(), branch, root)) return;
+      
+      // pk and pubShares are already determined by the data committed to under root, but we hash them in anyway
+      // just in case there was an error and pk or pubShares were produced incorrectly.
+      hash = hashToStr(pk.encodeStr() + '||' + pubShares.reduce((acc,p) => acc+'||'+p.encodeStr(),'')+'||'+root)
+      
+      hashes.set(hash, hashes.get(hash)||[] + [[ i, subShare ]])
+      hashesPubData.set(hash, [pk, pubShares])
+      
+      hashes.forEach((hash, support) => {
+        if (support.length >= f+1) {
+          share = interpolate(support.reduce((acc, [ j, subShare ]) => acc[j] = subShare, arrayOf(n)))
+        }
+        
+        if (support.length >= n-f) {
+          h = hash
+          pk = hashesPubData.get(hash)[0]
+          pubShares = hashesPubData.get(hash)[1]
+          broker.broadcast(tag+'r', hash)
+        }
+      })
+    })
+  })
+    .onCountMatching(n-f, (m, received) => {
+      echoesReceived = received
+      if (!readied) {
+        broker.broadcast(tag+'r', m)
+        readied = true
+      }
+    }).digest()
+  
+  receive(tag+'r', broker)
+    .onCountMatching(f+1, (m, received) => {
+      if (!readied) {
+        broker.broadcast(tag+'r', m)
+        readied = true
+      }
+    }).onCountMatching(n-f, (m, received) => {
+      if (echoesReceived && didntEcho)
+        didntEcho.resolve([ m, [...Array(n)].map((_,i) => i).filter(i => !echoesReceived[i]) ])
+      
+      result.resolve(m)
+    }).digest()
+  
+  return result.promise
+  
+  
+  
+  
+  
 
   reliableReceive(tag, sender, broker, m => {
     const ret = defer()
