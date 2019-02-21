@@ -4,13 +4,13 @@ const { randomBytes } = require('crypto')
 const BN = require('bn.js')
 const HmacDRBG = require('hmac-drbg')
 
-// ---------------------------------------------------------------
-
 const ecc = new EC('secp256k1')
 const Fr = BN.red(ecc.curve.redN)
 
 const skLength = 32
 const pkLength = 33
+
+// ------------------- Crypto object wrappers -------------------------
 
 function point(val_) {
   if (val_ === undefined) return undefined
@@ -56,6 +56,7 @@ function point(val_) {
         if (!P2.isPoint) throw "cannot compare a point with a non-point!"
         return (val.eq(P2.val))
       },
+      precompute:() => val.precompute(),
       encode:() => Buffer.from(val.encodeCompressed()),
       encodeStr:() => Buffer.from(val.encodeCompressed()).toString('base64').replace(/=/gi,'')
     }
@@ -116,10 +117,14 @@ function scalar(val_) {
   }
 }
 
+// ------------------- Crypto object manipulation functions -------------------------
+
+// generate a new uniformly random scalar
 function genSk() {
   while (true) {
     const r = new BN(randomBytes(skLength))
     
+    // check if byte sequence lies outside the scalar field
     if (r.cmpn(0) <= 0 || r.cmp(ecc.curve.n) >= 0)
       continue;
     
@@ -139,24 +144,37 @@ function sha512_256(m) {
   return sha('sha512').update(m).digest('hex').substr(0, 64)
 }
 
+// hash m to a uniformly distributed scalar
 function hashToScalar(m) {
-  return scalar(hashToBuf(m))
+  while (true) {
+    const r = new BN(hashToBuf(i+'||'+m))
+    
+    // check if byte sequence lies outside the scalar field
+    if (r.cmpn(0) <= 0 || r.cmp(ecc.curve.n) >= 0)
+      continue;
+    
+    return scalar(r)
+  }
 }
 
+// hash m to a uniformly distributed elliptic curve point
 function hashToPoint(m) {
-  let buf = Buffer.alloc(pkLength), i = 0, ret
+  let buf = Buffer.alloc(pkLength), ret
+  
+  // uniformly choose whether the y-coord is odd or even
+  buf[0] = (hashToBuf(m)[0] % 2) ? 2 : 3
 
-  while (true) {
-    let one = hashToStr(i+m)
-    buf[0] = (Buffer.from(one.padEnd(one.length+3-((one.length-1)&3),'='), 'base64')[0] % 2) ? 2 : 3
-    buf.set(hashToBuf(one+m), 1)
+  for (let i = 0; ; i++) {
+    // uniformly choose the x-coord; has a ~50% chance of lying on the curve
+    buf.set(hashToBuf(i+'||'+m), 1)
 
     try {
+      // TODO this code currently involves a square root even if buf is not on the curve
+      // due to the way elliptic.js works. this could be made ~2x faster using fast
+      // Legendre symbol computation
       ret = ecc.curve.decodePoint(buf)
       break
     } catch (e) { }
-    
-    i++
   }
 
   return point(ret)
@@ -169,6 +187,8 @@ function add(P1, P2, ...Pn) {
 function mul(P1, P2, ...Pn) {
   return !P2 ? P1 : mul(P1.mul(P2), ...Pn)
 }
+
+// ------------------- Serialization utility functions -------------------------
 
 function replaceECStuffWithStrs(obj) {
   if (typeof obj !== 'object') {
@@ -216,26 +236,32 @@ function decodeData(data, props, cb) {
   cb(fullyParsed)
 }
 
-// ---------------------------------------------------------------
+// ------------------- Other utility functions -------------------------
 
+// turns a function:index -> object into an array of objects
 function arrayOf(n, cb = () => undefined) {
   return [...Array(n)].map((_, i) => cb(i))
 }
 
+// creates a promise that can be resolved independent of construction
 function defer() {
   let resolve, reject
   const promise = new Promise((res, rej) => { resolve = res; reject = rej })
   return { resolve, reject, promise, then:cb => promise.then(cb) }
 }
 
-// ---------------------------------------------------------------
+// ------------------- Constants -------------------------
 
-const G = point(ecc.curve.g)
+const G = point(ecc.g)
 const G1 = hashToPoint('1')
-const G2 = hashToPoint('2')
-const G3 = hashToPoint('3')
+const AVSSG = hashToPoint('2')
+G.precompute() // should already be precomputed, just a sanity check
+G1.precompute()
+AVSSG.precompute()
 
-// ---------------------------------------------------------------
+// ------------------- Merkle tree manipulation functions -------------------------
+
+// NOTE currently all merkle tree code is unused
 
 function pathToLeaf(leaf, treeDepth) {
   return arrayOf(treeDepth, i => (leaf >> (treeDepth-1-i)) % 2)
@@ -281,13 +307,52 @@ function merkleBranchVerify(leaf, datum, branch, root) {
   return branch.reduce((acc, sideHash, i) => 'N'+hashToStr(pathFromLeaf[i] ? (sideHash+' '+acc) : (acc+' '+sideHash)), 'L'+hashToStr(JSON.stringify(datum))) === root
 }
 
-// ---------------------------------------------------------------
+// ------------------- Zero-knowedge proofs -------------------------
 
+// --- Schnorr proofs --- //
+// Schnorr proofs allow you to prove in zero knowledge that you know some
+// scalar sk such that pk = sk*G.
+
+// format: [ challenge, response ]
+const schnorrDecode = ['S', 'S']
+
+function schnorrSign(sk, m) {
+  // using deterministic nonces for safety
+  const nonce = hashToScalar(m.length + '||schnorr||' + hashToString(sk.encodeStr()) + '||' + m)
+  const pubNonce = nonce.mul(G)
+  
+  // TODO might as well hash the public key in here as well
+  const c = hashToScalar(pubNonce.encodeStr() + '||' + m)
+
+  return [ c, nonce.sub(sk.mul(c)) ]
+}
+
+function schnorrVerify(pk, m, [ c, z ]) {
+  const pubNonce_ = z.mul(G).add(pk.mul(c))
+  const c_ = hashToScalar(pubNonce_.encodeStr() + '||' + m)
+  
+  return c.equals(c_)
+}
+
+// --- Chaum-Pedersen proofs --- //
+// Chaum-Pedersen proofs allow you to prove in zero knowledge that
+// a given set of elliptic curve points are Diffie-Hellman triples.
+// i.e., given points (pk, H, sig) I prove that I know some scalar sk such
+// that pk = sk*G and sig = sk*H.
+//
+// NOTE this protocol is UNSAFE to use with curves that have a cofactor!
+
+// format: [ sig, proof=[ challenge, response ] ]
 const chaumPedersenDecode = ['P', ['S', 'S']]
 
 function chaumPedersenProve(sk, m) {
+  // if m is already a point, then we're proving knowledge of sk s.t. pk = sk*G, sig = sk*m
+  // if m is a message, then we instead prove pk = sk*G, sig = sk*hashToPoint(m), which is
+  // sort of like a signature over m.
   const H = (m.isPoint) ? m : hashToPoint(m)
-  const nonce = genSk()
+  
+  // using deterministic nonces for safety
+  const nonce = hashToScalar(m.length + '||CP||' + hashToString(sk.encodeStr()) + '||' + m)
   const pubNonceG = nonce.mul(G)
   const pubNonceH = nonce.mul(H)
   
@@ -305,13 +370,35 @@ function chaumPedersenVerify(pk, m, [ sig, [ c, z ] ]) {
   return c.equals(c_)
 }
 
-// ---------------------------------------------------------------
+// produce a perfect-hiding commitment to val.
+// the commitment is c = val*G + mask*G1. if mask is random, this reveals
+// nothing (information theoretically) about val. however producing
+// (val',mask') such that c = val'*G + mask'*G1 is hard without knowledge
+// of the discrete log of G1.
+function pedersenCommit(val, mask) {
+  if (!mask) mask = genSk()
+  return val.mul(G).add(mask.mul(G1))
+}
 
+function pedersenVerify(val, mask, commitment) {
+  return pedersenCommit(val, mask).equals(commitment)
+}
+
+// --- Perfect hiding Chaum-Pedersen proofs --- //
+// these proofs are similar to standard CP proofs, except instead of using
+// pk = sk*G, we instead use a Pedersen commitment to sk.
+//
+// NOTE this protocol is UNSAFE to use with curves that have a cofactor!
+
+// format: [ sig, proof=[ challenge, response1, response2 ] ]
 const chaumPedersenPHDecode = ['P', ['S', 'S', 'S']]
 
 function chaumPedersenPHProve(sk, mask, m) {
   const H = hashToPoint(m)
-  const nonce = genSk(), nonce1 = genSk()
+  
+  // using deterministic nonces for safety
+  const nonce = hashToScalar(m.length + '||CPPH0||' + hashToString(sk.encodeStr()) + '||' + m)
+  const nonce1 = hashToScalar(m.length + '||CPPH1||' + hashToString(sk.encodeStr()) + '||' + m)
   const pubNonceG = nonce.mul(G).add(nonce1.mul(G1))
   const pubNonceH = nonce.mul(H)
   
@@ -329,36 +416,15 @@ function chaumPedersenPHVerify(commit, m, [ sig, [ c, z, z1 ] ]) {
   return c.equals(c_)
 }
 
-// ---------------------------------------------------------------
+// --- Perfect hiding Chaum-Pedersen proofs --- //
+// these proofs are similar to standard CP proofs, except instead of using
+// pk = sk*G, we instead use pk = sk*G + mask*G1. this reveals no information
+// about sk (information theoretically), but it's computationally difficult to
+// find sk',mask' such that pk = sk'*G + mask'*G1.
+//
+// NOTE this protocol is UNSAFE to use with curves that have a cofactor!
 
-const schnorrDecode = ['S', 'S']
-
-function schnorrSign(sk, m) {
-  const nonce = genSk()
-  const pubNonce = nonce.mul(G)
-  
-  const c = hashToScalar(pubNonce.encodeStr() + m)
-
-  return [ c, nonce.sub(sk.mul(c)) ]
-}
-
-function schnorrVerify(pk, m, [ c, z ]) {
-  const pubNonce_ = z.mul(G).add(pk.mul(c))
-  const c_ = hashToScalar(pubNonce_.encodeStr() + m)
-  
-  return c.equals(c_)
-}
-
-// ---------------------------------------------------------------
-
-function pedersenCommit(val, mask) {
-  return val.mul(G).add(mask.mul(G1))
-}
-
-function pedersenVerify(val, mask, commitment) {
-  return pedersenCommit(val, mask).equals(commitment)
-}
-
+// format: [ sig, proof=[ challenge, response1, response2 ] ]
 const pedersenPKDecode = ['P', ['S', schnorrDecode]]
 
 function pedersenPKProve(val, mask) {
@@ -380,8 +446,10 @@ function polyEvalPlayer(constTerm, coeffs) {
   return i => polyEval(constTerm, coeffs, scalar(i+1))
 }
 
+// NOTE polynomial coeffs are derived deterministically from sk, so knowing sk immediately
+// allows you to compute everyone's secret shares.
 function secretShare(sk, t, n) {
-  const coeffs = arrayOf(t-1, genSk)
+  const coeffs = arrayOf(t-1, (i) => hashToScalar(hashToString(sk.encodeStr()) + '||poly||' + i))
   const shares = arrayOf(n, polyEvalPlayer(sk, coeffs))
   return { shares, coeffs }
 }
@@ -406,84 +474,87 @@ function interpolate(shares_, x_ = 0) {
 
 // ---------------------------------------------------------------
 
-// TODO: add polynomial commitments for better communication complexity
-function AVSSPHDeal(tag, sk, broker, reliableBroadcast, t) {
+// play the role of dealer for sharing threshold shards of sk, with reconstruction threshold t.
+// for certain use cases one might want to keep sk*G secret, so this function only reveals the
+// value sk*AVSSG, where AVSSG is a random point not used for anything else.
+//
+// TODO add polynomial commitments for better communication complexity
+// TODO investigate optimizations from https://arxiv.org/abs/1902.06095
+function AVSSDeal(tag, sk, broker, reliableBroadcast, t) {
   const n = broker.n, f = (n - 1)/3|0
   t = t||f+1
   
-  const skMask = genSk()
-  const skCommit = pedersenCommit(sk, skMask)
+  const pk = sk.mul(AVSSG)
+  // coeffs is a polynomial p of degree t-1, and shares[i] = p(i+1)
   const { shares:shares, coeffs:coeffs } = secretShare(sk, t, n)
-  const { shares:maskShares, coeffs:maskCoeffs } = secretShare(skMask, t, n)
-  const coeffCommits = coeffs.map((coeff, i) => pedersenCommit(coeff, maskCoeffs[i]))
+  const pubCoeffs = coeffs.map((coeff, i) => coeff.mul(AVSSG))
   
-  const sub = (ss) => ss.map((s, i) => secretShare(s, f+1, n))
-                        .reduce(({ sArrs, cArrs }, { shares, coeffs }) => {
-                          shares.forEach((s, i) => sArrs[i].push(s))
-                          cArrs.push(coeffs)
-                          
-                          return { sArrs, cArrs }
-                        }, { sArrs:arrayOf(n, () => [ ]), cArrs:[ ] })
-  
-  // subShares[i][j] = p_j(i) where p_j is a degree (k-1) polynomial with p_j(0) = shares[j]
-  // subCoeffs[i][j] = c_ij s.t. p_i = shares[i] + c_i1*x + ... + c_i(k-1)*x^f
-  const { sArrs:subShares, cArrs:subCoeffs } = sub(shares)
-  const { sArrs:subMaskShares, cArrs:subMaskCoeffs } = sub(maskShares)
-  const subCoeffCommits = subCoeffs.map((arr, i) => arr.map((coeff, j) => 
-                            pedersenCommit(coeff, subMaskCoeffs[i][j])))
+  // for each secret share s_i, produces a polynomial p_i of degree f, then slices
+  // the shares of these polynomials so that subShares[i][j] = p_j(i+1), subCoeffs[i] = p_i.
+  const { subShares, subCoeffs } = shares.map((s, i) => secretShare(s, f+1, n))
+                                         .reduce(({ subShares, subCoeffs }, { shares, coeffs }) => {
+                                           shares.forEach((s, i) => subShares[i].push(s))
+                                           subCoeffs.push(coeffs)
 
-  const mFunc = i => encodeData([ shares[i], maskShares[i], subShares[i], subMaskShares[i],
-                                  skCommit, coeffCommits, subCoeffCommits ])
+                                           return { subShares, subCoeffs }
+                                         }, { subShares:arrayOf(n, () => [ ]), subCoeffs:[ ] })
+  
+  const pubSubCoeffs = subCoeffs.map((arr, i) => arr.map((coeff, j) => coeff.mul(AVSSG)))
+
+  // reliably broadcast all the public verification keys and to each node send its shares and subshares.
+  const mFunc = i => encodeData([ shares[i], subShares[i],
+                                  pk, pubCoeffs, pubSubCoeffs ])
   reliableBroadcast(tag, mFunc, broker)
-
-  return hashToStr(encodeData([ skCommit, coeffCommits, subCoeffCommits ]))
+  
+  // short hash committing to the public verification keys
+  return hashToStr(encodeData([ pk, pubCoeffs, pubSubCoeffs ]))
 }
 
-function AVSSPHReceive(tag, sender, broker, reliableReceive, t) {
+function AVSSReceive(tag, sender, broker, reliableReceive, t) {
   const n = broker.n, f = (n - 1)/3|0
   t = t||f+1
   const result = defer(), didntEcho = defer(), shouldRecover = defer(), recoveredValue = defer()
-  let echoed = false, readied = false, recovered = false
+  let recovered = false
   
-  let share, maskShare, subShares, subMaskShares, skCommit, coeffCommits, subCoeffCommits, h
+  let share, subShares, pk, pubCoeffs, pubSubCoeffs, h
 
   reliableReceive(tag, sender, broker, m => {
     const ret = defer()
-    if (echoed) return true
     
-    decodeData(m, ['S', 'S', arrayOf(n, _ => 'S'),
-                             arrayOf(n, _ => 'S'), 'P',
-                   arrayOf(t-1, _ => 'P'),
-                   arrayOf(n, _ => arrayOf(f, _ => 'P'))], 
-    ([ share, maskShare, subShares, subMaskShares, skCommit, coeffCommits, subCoeffCommits ]) => {
-  
-      console.log('o hi mark')
-      if (pedersenCommit(share, maskShare)
-          .equals(polyEvalPlayer(skCommit, coeffCommits)(broker.thisHostIndex))) {
-        const shareCommits = arrayOf(n, polyEvalPlayer(skCommit, coeffCommits))
-        console.log('o hi mark deux')
-        
-        if (subShares.every((subShare, i) => pedersenCommit(subShare, subMaskShares[i])
-            .equals(polyEvalPlayer(shareCommits[i], subCoeffCommits[i])(broker.thisHostIndex)))) {
-          h = hashToStr(encodeData([skCommit, coeffCommits, subCoeffCommits]))
-          console.log('o hi mark dry')
+    decodeData(m, ['S', arrayOf(n, _ => 'S'),
+                   'P', arrayOf(t-1, _ => 'P'),
+                        arrayOf(n, _ => arrayOf(f, _ => 'P'))], 
+    ([ share, subShares, pk, pubCoeffs, pubSubCoeffs ]) => {
+      // check that our shares and subshares are all valid according to the public verification keys
+      // we received.
+      if (share.mul(AVSSG).equals(polyEvalPlayer(pk, pubCoeffs)(broker.thisHostIndex))) {
+        const pubShares = arrayOf(n, polyEvalPlayer(pk, coeffCommits))
+        if (subShares.every((subShare, i) => subShare.mul(AVSSG)
+                     .equals(polyEvalPlayer(pubShares[i], pubSubCoeffs[i])(broker.thisHostIndex)))) {
           
-          ret.resolve(h)
-          echoed = true
+          // do reliable broadcast on the hash of the public verification keys to make sure everyone
+          // received the same verification keys.
+          h = hashToStr(encodeData([pk, pubCoeffs, pubSubCoeffs]))
           
           didntEcho.then(([ h_, unrecoveredNodes ]) => {
+            // for all the nodes from whom we didn't receive an echo, send them our subshare of
+            // their share if the public verification keys we received were correct.
+            //
+            // TODO this is broken, we should send recovery messages not only to nodes that didn't
+            // echo, but also to nodes that echoed a message with invalid verification keys.
             if (h !== h_) return;
             unrecoveredNodes.forEach(j => broker.sendTo(tag+'u', j, 
-                                encodeData([ subShares[j], subMaskShares[j], skCommit,
-                                             shareCommits, subCoeffCommits[j] ])))
+                                encodeData([ subShares[j], pk, pubShares, pubSubCoeffs[j] ])))
           })
           
           shouldRecover.then(h_ => {
             if (h === h_) {
-              recoveredValue.resolve({ share, maskShare, skCommit, shareCommits })
+              recoveredValue.resolve({ share, pk, pubShares })
               recovered = true
             }
           })
+          
+          ret.resolve(h)
         }
       }
     })
