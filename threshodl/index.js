@@ -450,28 +450,27 @@ function pedersenPKVerify([ pk, [ mask, sig ] ], commitment) {
 // ---------------------------------------------------------------
 
 // evaluates the polynomial input p at evalPoint
-function polyEval(constTerm, coeffs, evalPoint) {
-  return add(constTerm, ...coeffs.map((c, j) => c.mul(evalPoint.toThe(scalar(j+1)))))
+function polyEval(evalPoint, constTerm, ...coeffs) {
+  return add(constTerm, ...coeffs.map((c, j) => c.mul(scalar(evalPoint).toThe(scalar(j+1)))))
 }
 
 // returns a function mapping a node index to p(i+1)
-function polyEvalPlayer(constTerm, coeffs) {
-  return i => polyEval(constTerm, coeffs, scalar(i+1))
+function polyEvalPlayer(constTerm, ...coeffs) {
+  return i => polyEval(i+1, constTerm, ...coeffs)
 }
 
 // NOTE polynomial coeffs are derived deterministically from sk, so knowing sk immediately
 // allows you to compute everyone's secret shares.
 function secretShare(sk, t, n) {
-  const coeffs = arrayOf(t-1, (i) => hashToScalar(hashToString(sk.encodeStr()) + '||poly||' + i))
-  const shares = arrayOf(n, polyEvalPlayer(sk, coeffs))
+  const coeffs = [ sk, ...arrayOf(t-1, (i) => hashToScalar(hashToString(sk.encodeStr()) + '||poly||' + i)) ]
+  const shares = arrayOf(n, polyEvalPlayer(...coeffs))
   return { shares, coeffs }
 }
 
 // evaluate at x_ the lowest-degree polynomial interpolating shares_
-// shares_ is formatted as an array where shares_[i] is expected to be truth-y iff
-// (i, shares_[i]) is an x-y pair to be interpolated.
-function interpolate(shares_, x_ = 0) {
-  const shares = shares_.reduce((acc, s, i) => { if (s) acc.push([i+1, s]); return acc }, [ ])
+// shares is formatted as an array of array pairs [i, share] indicating
+// all the points to be interpolated.
+function interpolateListAt(x_, shares) {
   const x = scalar(x_)
   
   // the values being interpolated can either be scalars or elliptic curve points
@@ -490,6 +489,21 @@ function interpolate(shares_, x_ = 0) {
   }, typeOfShares(0))
 }
 
+// evaluate at x_ the lowest-degree polynomial interpolating shares_
+// shares is formatted as an array where shares[i] is expected to be truth-y iff
+// (i, shares[i]) is an x-y pair to be interpolated.
+function interpolateAt(x_, shares) {
+  return interpolateListAt(x_, shares.reduce((acc, s, i) => { if (s) acc.push([i+1, s]); return acc }, [ ]))
+}
+
+function interpolateList(shares) {
+  return interpolateListAt(0, shares)
+}
+
+function interpolate(shares) {
+  return interpolateAt(0, shares)
+}
+
 // ---------------------------------------------------------------
 
 // play the role of dealer for sharing threshold shards of sk, with reconstruction threshold t.
@@ -498,7 +512,7 @@ function interpolate(shares_, x_ = 0) {
 //
 // TODO add polynomial commitments for better communication complexity
 // TODO investigate optimizations from https://arxiv.org/abs/1902.06095
-function AVSSDeal(tag, sk, broker, reliableBroadcast, t) {
+function AVSSDeal(tag, sk, broker, t) {
   const n = broker.n, f = (n - 1)/3|0
   t = t||f+1
   
@@ -509,215 +523,160 @@ function AVSSDeal(tag, sk, broker, reliableBroadcast, t) {
   // the shares of these polynomials so that subShares[i][j] = p_i(j+1), subCoeffs[i] = p_i.
   const { subShares, subCoeffs } = shares.map((s, i) => secretShare(s, f+1, n))
                                          .reduce(({ subShares, subCoeffs }, { shares, coeffs }) => {
-                                           return { subShares+shares, subCoeffs+coeffs }
+                                           return { subShares+[shares], subCoeffs+[coeffs] }
                                          }, { subShares:[ ], subCoeffs:[ ] })
   
   // subShareSlices[i][j] = p_j(i+1), so that seeing subShareSlices[_][j] for enough values
   // allows you to interpolate p_j.
-  const subShareSlices = arrayOf(n, i => arrayOf(n, j => subShares[j][i]))
-  const pubSubShares = subShares.map(arr => arr.map(share => share.mul(AVSSG)))
-
-  // reliably broadcast all the public verification keys and to each node send its subshares.
-  // we don't need to send the actual shares because they will be reconstructed from other
-  // nodes' subshares. similarly, pk and pubCoeffs are derived from pubSubCoeffs.
-  const mFunc = i => encodeData([ subShareSlices[i], pubSubShares ])
-  broker.send(tag+'i', mFunc)
+  const subShareSlices = arrayOf(n, i => arrayOf(n, j => subShares[j][i])) // (n, n)
   
-  // short hash committing to the public verification keys
-  return hashToStr(encodeData([ pk, pubCoeffs, pubSubCoeffs ]))
+  const pubCoeffs = coeffs.map(coeff => coeff.mul(AVSSG)) // (t)
+  const pubSubCoeffs = subCoeffs.map(arr => arr.map(coeff => coeff.mul(AVSSG))) // (n, f+1)
+  const pubSubShares = subShares.map(arr => arr.map(share => share.mul(AVSSG))) // (n, n)
+
+  // reliably broadcast all the public verification keys and to each node send its slices of the subshares.
+  //
+  // we don't need to send the actual share because it will be reconstructed from subshares pulled from
+  // other nodes' slices. similarly, pk and pubCoeffs are derived from pubSubCoeffs.
+  const mFunc = i => encodeData([ subShareSlices[i], pubCoeffs, pubSubCoeffs, pubSubShares ])
+  broker.send(tag+'i', mFunc)
 }
 
-function AVSSReceive(tag, sender, broker, reliableReceive, t) {
+function AVSSReceive(tag, sender, broker, t) {
   const n = broker.n, f = (n - 1)/3|0
   t = t||f+1
-  const result = defer(), didntEcho = defer(), shouldRecover = defer(), recoveredValue = defer()
-  let echoed = false, readied = false, recovered = false
   
+  const result = defer(), onRecoveredData = defer()
+  
+  let echoed = false, readied = false, finished = false
   let share, pk, pubCoeffs, pubSubCoeffs, h, tree
   
-  
-  
-  
-  let result = defer(), echoesReceived = arrayOf(n)
-  
+  // initial message received directly from the dealer
   broker.receiveFrom(tag+'i', sender, m => {
     if (!echoed) {
       echoed = true
       
-      decodeData(m, [ arrayOf(n, _ => 'S'), arrayOf(n, _ => arrayOf(n, _ => 'P'))], 
-        ([ subShareSlice, pubSubShares ]) => {        
-        // check that the polynomial interpolating pubSubShares[i] has degree at most f for all i.
-        //
-        // this works because two distinct small-degree polynomials are only equal on a negligible number
-        // of points, and interpolated polynomials always have small degree.
-        // thus if the first interpolated value equals the second, then with overwhelming probability
-        // the polynomial interpolating pubSubShares[i] is the same as the polynomial interpolating the first
-        // f+1 shares, which has degree at most f.
-        let randPoint = genSk()
-        if (!pubSubShares.every((pubSubShare, i) => {
-          let fullPolyAtRandPoint = interpolate(pubSubShare, randPoint)
-          let degreeLessThanTPolyAtRandPoint = interpolate(pubSubShare.map((s,i) => (i<f+1) ? s : false), randPoint)
-          return (fullPolyAtRandPoint === degreeLessThanTPolyAtRandPoint)
-        }) return;
+      decodeData(m, [ arrayOf(n, _ => 'S'), arrayOf(t, _ => 'P'),
+                      arrayOf(n, _ => arrayOf(f+1, _ => 'P')),
+                      arrayOf(n, _ => arrayOf(n, _ => 'P'))], 
+        ([ subShareSlice, pubCoeffs, pubSubCoeffs, pubSubShares ]) => {
         
-        let pubShares = pubSubShares.map(pubSubShare => interpolate(pubSubShare))
+        // checking pubSubShares and pubSubCoeffs are coherent.
+        {
+          // check that the polynomial interpolating pubSubShares[i] has degree at most f for all i.
+          //
+          // this works because two distinct small-degree polynomials are only equal on a negligible number
+          // of points, and interpolated polynomials always have degree < n.
+          // thus if the first interpolated value equals the second, then with overwhelming probability
+          // the polynomial interpolating pubSubShares[i] is pubSubCoeffs[i], which has degree f.
+          let randPoint = genSk()
+          for (let i = 0; i < n; i++) {
+            let interpolatedPolyAtRandPoint = interpolateAt(randPoint, pubSubShares[i])
+            let pubSubCoeffsAtRandPoint = polyEval(randPoint, ...pubSubCoeffs[i])
+            if (interpolatedPolyAtRandPoint !== pubSubCoeffsAtRandPoint)
+              return;
+          }
+        }
         
-        // check that the polynomial interpolating pubShares has degree at most t-1.
-        let fullPolyAtRandPoint = interpolate(pubShares, randPoint)
-        let degreeLessThanTPolyAtRandPoint = interpolate(pubShares.map((s,i) => (i<t) ? s : false), randPoint)
-        if (fullPolyAtRandPoint !== degreeLessThanTPolyAtRandPoint)
-          return;
+        // by the check above we know pubSubCoeffs[i][0] = p_i(0), where p_i is the degree f polynomial
+        // interpolating pubSubShares[i].
+        let pubShares = pubSubCoeffs.map(arr => arr[0])
+        
+        // checking pubShares and pubCoeffs are coherent.
+        {
+          // check that the polynomial interpolating pubShares has degree at most t-1, same way as before.
+          let interpolatedPolyAtRandPoint = interpolateAt(randPoint, pubShares)
+          let pubCoeffsAtRandPoint = polyEval(randPoint, ...pubCoeffs)
+          if (interpolatedPolyAtRandPoint !== pubCoeffsAtRandPoint)
+            return;
+        }
         
         // check all our subshares are valid evaluations of the polys committed to under pubSubCoeffs
         if (!subShareSlice.every((subShare, i) => subShare.mul(AVSSG).equals(pubSubShares[i][broker.thisHostIndex])))
           return;
         
-        pk = interpolate(pubShares)
+        let pk = pubCoeffs[0]
         
         // build a Merkle tree over all the verification keys for all subshares.
         tree = merkleConstruct(pubSubShares.reduce((acc, arr) => acc+arr.map(p => p.encodeStr()), []))
         
         // send every node our subShare of their share, along with a merkle proof for it.
-        const mFunc = i => encodeData([ subShares[i], pk, pubShares, tree.root, tree.branch(i*n+broker.thisHostIndex) ])
+        // TODO erasure-code pubShares to reduce communication complexity to n^2.
+        const mFunc = i => encodeData([ subShareSlice[i], pk, pubShares, tree.root, tree.branch(i*n+broker.thisHostIndex) ])
         broker.send(tag+'e', mFunc)
       })
     }
   })
   
+  // we now do a sort of reliable broadcast to ensure that everyone received consistent
+  // public verification data.
   broker.receive(tag+'e', (i, m) => {
+    if (finished) return;
+
     decodeData(m, [ 'S', 'P', arrayOf(n, _ => 'P'), 'T', arrayOf(depth_(n*n), _ => 'T')], 
       ([ subShare, pk, pubShares, root, branch ]) => {
       pubSubShare = subShare.mul(AVSSG)
       if (!merkleBranchVerify(broker.thisHostIndex*n + i, pubSubShare.encodeStr(), branch, root)) return;
       
       // pk and pubShares are already determined by the data committed to under root, but we hash them in anyway
-      // just in case there was an error and pk or pubShares were produced incorrectly.
+      // just for caution in case there was a bug/error.
       hash = hashToStr(pk.encodeStr() + '||' + pubShares.reduce((acc,p) => acc+'||'+p.encodeStr(),'')+'||'+root)
       
+      // add node i and its data to the list of nodes that echoed hash
       hashes.set(hash, hashes.get(hash)||[] + [[ i, subShare ]])
       hashesPubData.set(hash, [pk, pubShares])
       
       hashes.forEach((hash, support) => {
-        if (support.length >= f+1) {
-          share = interpolate(support.reduce((acc, [ j, subShare ]) => acc[j] = subShare, arrayOf(n)))
+        // ready after seeing n-f echoes for a common public data hash
+        if (support.length >= n-f && !readied) {
+          h = hash
+          broker.broadcast(tag+'r', hash)
+          readied = true
         }
         
-        if (support.length >= n-f) {
-          h = hash
-          pk = hashesPubData.get(hash)[0]
-          pubShares = hashesPubData.get(hash)[1]
-          broker.broadcast(tag+'r', hash)
+        // once we learn that this hash is the unique value that was committed to, we can reconstruct
+        // our share from f+1 subshares corresponding to messages sent under that hash.
+        if (support.length >= f+1 && h && h === hash) {
+          onRecoveredData.resolve({
+            share: interpolateList(support)
+            pk: hashesPubData.get(hash)[0]
+            pubShares: hashesPubData.get(hash)[1]
+          })
         }
       })
     })
   })
-    .onCountMatching(n-f, (m, received) => {
-      echoesReceived = received
-      if (!readied) {
-        broker.broadcast(tag+'r', m)
-        readied = true
-      }
-    }).digest()
   
-  receive(tag+'r', broker)
-    .onCountMatching(f+1, (m, received) => {
-      if (!readied) {
-        broker.broadcast(tag+'r', m)
+  broker.receive(tag+'r', (i, hash) => {
+    readyHashes.set(hash, readyHashes.get(hash)||0 + 1)
+    
+    readyHashes.forEach((hash, supportCount) => {
+      // ready if we haven't done so already after seeing f+1 other readies
+      if (supportCount >= f+1 && !readied) {
+        h = hash
+        broker.broadcast(tag+'r', hash)
         readied = true
       }
-    }).onCountMatching(n-f, (m, received) => {
-      if (echoesReceived && didntEcho)
-        didntEcho.resolve([ m, [...Array(n)].map((_,i) => i).filter(i => !echoesReceived[i]) ])
       
-      result.resolve(m)
-    }).digest()
+      if (supportCount >= n-f) {
+        // due to asynchrony and Byzantine behavior the "if (support.length >= f+1 && h && h === hash)"
+        // check above might only be triggered before h is set, so we need to check if we can recover
+        // here as well.
+        if (hashes.has(hash) && hashes.get(hash).length >= f+1) {
+          onRecoveredData.resolve({
+            share: interpolateList(hashes.get(hash))
+            pk: hashesPubData.get(hash)[0]
+            pubShares: hashesPubData.get(hash)[1]
+          })
+        }
+        
+        // n-f readies guarantees every node will eventually recover their share
+        onRecoveredData.then(r => result.resolve(r))
+      }
+    })
+  })
   
   return result.promise
-  
-  
-  
-  
-  
-
-  reliableReceive(tag, sender, broker, m => {
-    const ret = defer()
-    
-    decodeData(m, ['S', arrayOf(n, _ => 'S'),
-                   'P', arrayOf(t-1, _ => 'P'),
-                        arrayOf(n, _ => arrayOf(f, _ => 'P'))], 
-    ([ share, subShares, pk, pubCoeffs, pubSubCoeffs ]) => {
-      // check that our shares and subshares are all valid according to the public verification keys
-      // we received.
-      if (share.mul(AVSSG).equals(polyEvalPlayer(pk, pubCoeffs)(broker.thisHostIndex))) {
-        const pubShares = arrayOf(n, polyEvalPlayer(pk, coeffCommits))
-        if (subShares.every((subShare, i) => subShare.mul(AVSSG)
-                     .equals(polyEvalPlayer(pubShares[i], pubSubCoeffs[i])(broker.thisHostIndex)))) {
-          
-          // do reliable broadcast on the hash of the public verification keys to make sure everyone
-          // received the same verification keys.
-          h = hashToStr(encodeData([pk, pubCoeffs, pubSubCoeffs]))
-          
-          didntEcho.then(([ h_, unrecoveredNodes ]) => {
-            // for all the nodes from whom we didn't receive an echo, send them our subshare of
-            // their share if the public verification keys we received were correct.
-            //
-            // TODO this is broken, we should send recovery messages not only to nodes that didn't
-            // echo, but also to nodes that echoed a message with invalid verification keys.
-            if (h !== h_) return;
-            unrecoveredNodes.forEach(j => broker.sendTo(tag+'u', j, 
-                                encodeData([ subShares[j], pk, pubShares, pubSubCoeffs[j] ])))
-          })
-          
-          shouldRecover.then(h_ => {
-            if (h === h_) {
-              recoveredValue.resolve({ share, pk, pubShares })
-              recovered = true
-            }
-          })
-          
-          ret.resolve(h)
-        }
-      }
-    })
-    
-    return ret.promise
-  }, didntEcho)
-  .then(h_ => {
-    shouldRecover.resolve(h_)
-    result.resolve(recoveredValue)
-  })
-  
-  const recoveryData = arrayOf(n)
-  broker.receive(tag+'u', (i, data) => {
-    if (recovered) return true
-    
-    decodeData(data, ['S', 'S', 'P',
-                       arrayOf(n, _ => 'P'),
-                       arrayOf(f, _ => 'P')],
-    ([ subShare, subMaskShare, skCommit, shareCommits, subCoeffCommits ]) => {
-      const c_ = hashToStr(encodeData([skCommit, shareCommits, subCoeffCommits]))
-      recoveryData[i] = { subShare, subMaskShare, c_, tested:false }
-      
-      shouldRecover.then((h_) => {
-        if ((h && h === h_) || recovered) return;
-        
-        if (pedersenCommit(subShare, subMaskShare)
-            .equals(polyEvalPlayer(shareCommits[broker.thisHostIndex], subCoeffCommits)(i))) {
-          recoveryData[i].tested = true
-          
-          let matching = recoveryData.filter(dat => (dat && dat.tested && dat.c_ === c_))
-          if (matching.length >= f+1) {
-            share = interpolate(recoveryData.map(dat => dat && dat.subShare))
-            maskShare = interpolate(recoveryData.map(dat => dat && dat.subMaskShare))
-            recoveredValue.resolve({ share, maskShare, skCommit, shareCommits })
-            recovered = true
-          }
-        }
-      })
-    })
-  })
-  
-  return result
 }
 
 // ---------------------------------------------------------------
@@ -726,24 +685,30 @@ function AVSSReceive(tag, sender, broker, reliableReceive, t) {
 // using Boldyreva threshold signatures, but rather than verifying the
 // shares using a pairing we instead use a Chaum-Pedersen NIZK to prove
 // equality of discrete logs. Note this precludes aggregate verification.
-function setupCommonCoin(tag, broker, sk, pks) {
+function setupCommonCoin(tag, broker, share, pubShares) {
+  // after initialization, this resolves to a function that can be called
+  // with a subtag tag_ to instantiate arbitrarily many coins.
   return Promise.resolve((tag_) => {
     const n = broker.n, f = (n - 1)/3|0
     const result = defer()
 
     const id = tag.length+' '+tag+tag_
-    broker.broadcast(tag+tag_, 
-      chaumPedersenEncode(chaumPefersenProve(sk, id)))
     
-    const shares = arrayOf(n)
+    // our coin share is share*hashToPoint(id), and we include a CP proof that this
+    // coin share was produced correctly.
+    broker.broadcast(tag+tag_, encodeData(chaumPefersenProve(share, id)))
+    
+    const coinShares = arrayOf(n)
     let count = 0
     broker.receive(tag+tag_, (i, m) => {
-      chaumPedersenDecode(m, cpProof => {
-        if (chaumPedersenVerify(pks[i], id, cpProof)) {
-          shares[i] = cpProof.sig
+      decodeData(m, chaumPedersenDecode, ([ sig, proof ]) => {
+        if (chaumPedersenVerify(pubShares[i], id, [ sig, proof ])) {
+          coinShares[i] = sig
           count++
           if (count >= f+1) {
-            result.resolve(hashToStr(interpolate(shares)))
+            // the coin value is the string hash of p(0), where p is the polynomial interpolating
+            // [ i+1, share[i]*hashToPoint(id) ] for each node i.
+            result.resolve(hashToStr(interpolate(coinShares)))
           }
         }
       })
@@ -753,23 +718,48 @@ function setupCommonCoin(tag, broker, sk, pks) {
   })
 }
 
+// a subprimitive of asynchronous distributed key gen. the purpose of this protocol is to assign
+// to each honest node a threshold-shared secret that no one knows.
+//
+// works by having each node i deal a shared secret s_i through AVSS. i then chooses a list A_i
+// consisting of f+1 terminated AVSS instaces and reliably broadcasts A_i. i's shared secret is then
+// defined to be the sum of the shared secrets from all instances in A_i, which is guaranteed to be
+// secret since at least one of those instances must have been from an honest node.
+//
+// returns:
+//   - G: a reference to an array of node indices for all nodes whose shared secret has been built.
+//   - As: an array of promises for each node's A list, describing how to reconstruct its shared secret.
+//   - shares: an array of promises for the secret share and public verification data we get from each
+//             AVSS instance.
+//   - onAddToG: a callback that can be called whenever a new node is added to G.
+//
+// NOTE some nodes may be assigned the same shared secret.
 function setupKeygenProposals(tag, broker, reliableBroadcast, reliableReceive) {
   const n = broker.n, f = (n - 1)/3|0
   const result = defer()
 
-  // Each node deals a secret
+  // each node deals a secret
   const r = genSk()
-  AVSSPHDeal(tag+'a'+broker.thisHostIndex, r, broker, reliableBroadcast)
+  AVSSDeal(tag+'a'+broker.thisHostIndex, r, broker)
   
+  // participate as a receiver in every node's AVSS instance
   const AVSSInstances = arrayOf(n, i => 
-    AVSSPHReceive(tag+'a'+i, i, broker, reliableReceive))
+    AVSSReceive(tag+'a'+i, i, broker))
   
-  const pendingAttaches = arrayOf(n, () => [ defer(), defer() ]),
-        pendingAttachesFinalized = arrayOf(n, () => [ defer(), defer() ])
-        
-  const C = [ ], G = [ ]
+  // C is the list of all nodes whose AVSS instance has successfully terminated.
+  // each node will get a shared secret corresponding to them; the secret corresponding
+  // to us will be the sum of the secrets shared by nodes in C. importantly, NO ONE,
+  // not even ourself, knows the shared secret corresponding to us.
+  const C = [ ]
+  
   let accepted = false, readied = false
   
+  // arr is a list of pairs [ p1, p2 ], where p1 and p2 are promises for a list of node indices.
+  // calling update(arr) will wait until p1 resolves, then check if C contains p1 and if so
+  // resolves p2 to p1.
+  //
+  // by calling update(arr) every time C is updated, this ensures that p2 will eventually resolve to
+  // p1 iff p1 eventually is contained in C.
   function update(arr) {
     arr.forEach(async ([p1, p2]) => {
       const A = await p1
@@ -778,43 +768,66 @@ function setupKeygenProposals(tag, broker, reliableBroadcast, reliableReceive) {
     })
   }
   
-  
+  const pendingAttaches = arrayOf(n, () => [ defer(), defer() ]),
+        pendingAttachesFinalized = arrayOf(n, () => [ defer(), defer() ])
   
   AVSSInstances.forEach(async (p, i) => {
     await p
     
+    // i's AVSS instance terminated succesfully, so add it to C and update the lists dependent on C.
     C.push(i)
     update(pendingAttaches)
     update(pendingAttachesFinalized)
     
+    // once C is big enough, reliably broadcast it to everyone else.
+    // this is reliably broadcasted because we need every node to agree on the shared secret
+    // corresponding to us.
     if (!accepted && C.length >= f+1) {
       reliableBroadcast(tag+'c'+broker.thisHostIndex, JSON.stringify(C), broker)
       accepted = true
     }
   })
   
+  
+  
+  // G is the list of all nodes from whom we've successfully received their reliably broadcasted C-list
+  const G = [ ]
+  
+  // attaches[i] resolves to a stringified list of i's C-list after we've received and verified it
   const attaches = arrayOf(n, i =>
     reliableReceive(tag+'c'+i, i, broker, m => {
       try {
+        // on receiving a node's C-list, try to parse it as an array then remove duplicates
+        // and check if it's large enough.
         let A = [...(new Set(JSON.parse(m))).values()]
         if (A.length >= f+1) {
+          // pendingAttaches[i][1] will resolve to A only after we've verified that the AVSS
+          // instace for every node in A's C-list actually DOES terminate.
           pendingAttaches[i][0].resolve(A)
         }
       } catch (e) { }
       
+      // only echo the list after we've verified it.
       return pendingAttaches[i][1].then(A => JSON.stringify(A))
-    }))
+    })
+  )
   
+  // in case G gets further updated after we've moved on to future steps, this function can be
+  // modified to allow calling back whenever G is updated.
   let onAddToG_ = () => { }
+  
   attaches.forEach(async (p, i) => {
     const A = JSON.parse(await p)
     pendingAttachesFinalized[i][0].resolve(A)
     
+    // wait until we've accepted reliable broadcast for i's C-list AND we've verified its validity.
     await pendingAttachesFinalized[i][1]
     
     G.push(i)
     onAddToG_()
     
+    // we've received as many C-lists as we can reasonably wait for, so we move on to trying
+    // to stabilize G.
     if (!readied && G.length >= n-f) {
       result.resolve({
         G,
@@ -829,6 +842,10 @@ function setupKeygenProposals(tag, broker, reliableBroadcast, reliableReceive) {
   return result.promise
 }
 
+// after we've worked out assigning shared secrets to as many nodes as possible, we now need to
+// "stabilize" G. i.e., we want to pass G-sets back and forth until we can guarantee that the
+// intersection of ALL honest nodes' G-sets contains a constant fraction of all the nodes in the
+// more specifically, the protocol we use guarantees the intersection has size at least n/2 nodes.
 async function setupKeygenProposalsStable(tag, broker, reliableBroadcast, reliableReceive) {
   const n = broker.n, f = (n - 1)/3|0
   const result = defer()
