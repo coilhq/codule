@@ -254,10 +254,8 @@ function defer() {
 
 const G = point(ecc.g)
 const G1 = hashToPoint('1')
-const AVSSG = hashToPoint('2')
 G.precompute() // should already be precomputed, just a sanity check
 G1.precompute()
-AVSSG.precompute()
 
 // ------------------- Merkle tree manipulation functions -------------------------
 
@@ -506,11 +504,11 @@ function interpolate(shares) {
 
 // ---------------------------------------------------------------
 
-// play the role of dealer for sharing threshold shards of sk, with reconstruction threshold t.
-// for certain use cases one might want to keep sk*G secret, so this function only reveals the
-// value sk*AVSSG, where AVSSG is a random point not used for anything else.
+// play the role of dealer for sharing threshold shards of sk, with reconstruction threshold t
 //
-// TODO add polynomial commitments for better communication complexity
+// NOTE this reveals sk*G and share*G for every share
+//
+// TODO investigate adding polynomial commitments for better communication complexity
 // TODO investigate optimizations from https://arxiv.org/abs/1902.06095
 function AVSSDeal(tag, sk, broker, t) {
   const n = broker.n, f = (n - 1)/3|0
@@ -530,9 +528,9 @@ function AVSSDeal(tag, sk, broker, t) {
   // allows you to interpolate p_j.
   const subShareSlices = arrayOf(n, i => arrayOf(n, j => subShares[j][i])) // (n, n)
   
-  const pubCoeffs = coeffs.map(coeff => coeff.mul(AVSSG)) // (t)
-  const pubSubCoeffs = subCoeffs.map(arr => arr.map(coeff => coeff.mul(AVSSG))) // (n, f+1)
-  const pubSubShares = subShares.map(arr => arr.map(share => share.mul(AVSSG))) // (n, n)
+  const pubCoeffs = coeffs.map(coeff => coeff.mul(G)) // (t)
+  const pubSubCoeffs = subCoeffs.map(arr => arr.map(coeff => coeff.mul(G))) // (n, f+1)
+  const pubSubShares = subShares.map(arr => arr.map(share => share.mul(G))) // (n, n)
 
   // reliably broadcast all the public verification keys and to each node send its slices of the subshares.
   //
@@ -592,7 +590,7 @@ function AVSSReceive(tag, sender, broker, t) {
         }
         
         // check all our subshares are valid evaluations of the polys committed to under pubSubCoeffs
-        if (!subShareSlice.every((subShare, i) => subShare.mul(AVSSG).equals(pubSubShares[i][broker.thisHostIndex])))
+        if (!subShareSlice.every((subShare, i) => subShare.mul(G).equals(pubSubShares[i][broker.thisHostIndex])))
           return;
         
         let pk = pubCoeffs[0]
@@ -615,7 +613,7 @@ function AVSSReceive(tag, sender, broker, t) {
 
     decodeData(m, [ 'S', 'P', arrayOf(n, _ => 'P'), 'T', arrayOf(depth_(n*n), _ => 'T')], 
       ([ subShare, pk, pubShares, root, branch ]) => {
-      pubSubShare = subShare.mul(AVSSG)
+      pubSubShare = subShare.mul(G)
       if (!merkleBranchVerify(broker.thisHostIndex*n + i, pubSubShare.encodeStr(), branch, root)) return;
       
       // pk and pubShares are already determined by the data committed to under root, but we hash them in anyway
@@ -845,7 +843,23 @@ function setupKeygenProposals(tag, broker, reliableBroadcast, reliableReceive) {
 // after we've worked out assigning shared secrets to as many nodes as possible, we now need to
 // "stabilize" G. i.e., we want to pass G-sets back and forth until we can guarantee that the
 // intersection of ALL honest nodes' G-sets contains a constant fraction of all the nodes in the
-// more specifically, the protocol we use guarantees the intersection has size at least n/2 nodes.
+// more specifically, the protocol we use guarantees the intersection has size greater than n/2 nodes.
+//
+// this works by simply having each node reliably broadcast their G-set, then taking the union of n-f
+// such sets (after checking they're valid). the following double-counting argument shows this works:
+//   let X := {i such that #{G-sets NOT containing i} >= n-f}.
+//   by definition, any node NOT in X must be in the intersection of any possible union of n-f G-sets.
+//   thus it suffices to show |X|<n/2. indeed,
+//       |X|(n-f) <= sum_{nodes i} #{G-sets not containing i}     // definition of X
+//                 = sum_{G-sets R} #{nodes not contained in R}   // using double-counting
+//                <= n*f.                                         // since each G-set contains n-f nodes
+//   so |X|(n-f) <= n*f, from which |X| < n/2 immediately follows. QED
+// credit to Alex Ravsky for inspiring this proof: https://math.stackexchange.com/a/2442870/207264
+//
+// to simplify things, we do another G-set negotiation round to produce two sets, Z and G, where Z is
+// a subset of G with the same intersection properties as above, and G contains every other node's Z.
+// this allows us to avoid needing to continue keeping track of new additions to G for the sake of
+// validity checking other nodes' outputs.
 async function setupKeygenProposalsStable(tag, broker, reliableBroadcast, reliableReceive) {
   const n = broker.n, f = (n - 1)/3|0
   const result = defer()
@@ -855,28 +869,16 @@ async function setupKeygenProposalsStable(tag, broker, reliableBroadcast, reliab
         pendingOuters = arrayOf(n, () => [ defer(), defer(), defer() ]),
         pendingOutersFinalized = arrayOf(n, () => [ defer(), defer() ])
   
-  pendingOuters.forEach(async ([p1, p2, p3], i) => {
-    const O = await p3
-    let count = 0
-    
-    pendingReadiesFinalized.forEach(async ([p1B]) => {
-      const B = await p1B
-      
-      if (B.every(j => O.includes(j))) {
-        count++
-        if (count >= n-f)
-          p1.resolve(O)
-      }
-    })
-  })
-  
   
   
   const { G, As, shares, onAddToG } = 
     await setupKeygenProposals(tag, broker, reliableBroadcast, reliableReceive)
   
+  // our view of G contains n-f nodes at this point; reliably broadcast it
   reliableBroadcast(tag+'g'+broker.thisHostIndex, JSON.stringify(G), broker)
   
+  // for each item in arr, resolves the second promise only after the first promise is
+  // entirely contained within G.
   function update(arr) {
     arr.forEach(async ([p1, p2]) => {
       const A = await p1
@@ -885,6 +887,8 @@ async function setupKeygenProposalsStable(tag, broker, reliableBroadcast, reliab
     })
   }
   
+  // readies and outers consist of nodes that other nodes said were contained in G, so
+  // we want to verify that they're telling the truth.
   onAddToG(() => {
     update(pendingReadies)
     update(pendingReadiesFinalized)
@@ -893,7 +897,8 @@ async function setupKeygenProposalsStable(tag, broker, reliableBroadcast, reliab
   })
   
   
-  
+  // each node's ready is the G-set we received from them, and we need to verify it's
+  // valid before echoing it.
   const readies = arrayOf(n, i =>
     reliableReceive(tag+'g'+i, i, broker, m => {
       try {
@@ -911,26 +916,53 @@ async function setupKeygenProposalsStable(tag, broker, reliableBroadcast, reliab
     const B = JSON.parse(await p)
     pendingReadiesFinalized[i][0].resolve(B)
     
+    // wait until we've accepted reliable broadcast for i's ready, and verified it's contained in G.
     await pendingReadiesFinalized[i][1]
     
     countB++
     if (!outerd && countB >= n-f) {
+      // G now contains the union of n-f other nodes' initial G-sets.
       reliableBroadcast(tag+'o'+broker.thisHostIndex, JSON.stringify(G), broker)
       outerd = true
     }
   })
   
+  // each node's outer is the extended G-set we received from them, so we again need
+  // to verify it's valid before echoing it.
   const outers = arrayOf(n, i =>
     reliableReceive(tag+'o'+i, i, broker, m => {
       try {
         let O = [...(new Set(JSON.parse(m))).values()]
         if (O.length >= n-f) {
+          // NOTE this resolves pendingOuters[i][2], NOT pendingOuters[i][0].
+          // this triggers the check below to see that O is big enough before
+          // checking that it's small enough.
           pendingOuters[i][2].resolve(O)
         }
       } catch (e) { }
       
       return pendingOuters[i][1].then(O => JSON.stringify(O))
     }))
+  
+  // for outers, we need to guarantee not only that the outer is contained in G, but
+  // also that the outer contains at least n-f readies.
+  // note that since the readies are reliably broadcast, any ready we use to build our
+  // own extended G will eventually resolve for every other node, so this check won't
+  // halt forever.
+  pendingOuters.forEach(async ([p1, p2, p3], i) => {
+    const O = await p3
+    let count = 0
+    
+    pendingReadiesFinalized.forEach(async ([p1B]) => {
+      const B = await p1B
+      
+      if (B.every(j => O.includes(j))) {
+        count++
+        if (count >= n-f)
+          p1.resolve(O)
+      }
+    })
+  })
   
   let acceptedOuters = [ ]
   outers.forEach(async (p, i) => {
@@ -942,11 +974,20 @@ async function setupKeygenProposalsStable(tag, broker, reliableBroadcast, reliab
     acceptedOuters.push(O)
     
     if (acceptedOuters.length >= n-f) {
+      // after we've received n-f extended G-sets, finalZ is set to be their intersection
+      // and finalG is set to be their union.
+      // by construction, every node's finalZ is contained in our finalG. this allows us to
+      // stop paying attention to new additions to G for simplicity.
       const finalZ = acceptedOuters.reduce((acc, Oset) => acc.filter(j => Oset.includes(j))),
             finalG = acceptedOuters.reduce((acc, Oset) => [...new Set([...acc, ...Oset])])
       
+      // As from nodes not present in finalG are irrelevant, so we toss them out.
+      // we then await all the ones we didn't toss out, since we're guaranteed to
+      // eventually receive them.
       const As_ = await Promise.all(As.map((p,j) => 
         G.includes(j) ? p : Promise.resolve(undefined)))
+      // similarly we can toss out all the shares from nodes in the As we tossed out
+      // and await the ones remaining.
       const shares_ = await Promise.all(shares.map((p, i) => 
         As_.some(A => (A && A.includes(i))) ? p : Promise.resolve(undefined)))
       
@@ -957,78 +998,98 @@ async function setupKeygenProposalsStable(tag, broker, reliableBroadcast, reliab
   return result.promise
 }
 
-// Modified version of Canetti's threshold-cryptography-free common coin.
-// Modifications are:
-//   - Uses consistent AVSS instead of full AVSS since we're in the computational
+// modified version of Canetti's DKG-less common coin. modifications are:
+//   - we use consistent AVSS instead of full AVSS since we're in the computational
 //     setting where we can verify shares.
-//   - Instead of sharing n^2 secrets, we just share s[1],..,s[n] and take
-//     the (i, j) secret to be F(s[i], j), where F is a key-homomorphic prf.
-//   - Most of the protocol is done only once to derive the shared secrets; after
-//     that we use F to derive the partially shared random values for each coin flip.
-//   - A tighter analysis of the overlap of the Z sets reveals that |M|>n/2, so I
-//     increased u to n+1 which makes the coin common-random more often.
-//     Specifically, Pr[c=1 for all nodes], Pr[c=0 for all nodes] >= 0.36 for n>=4.
-//     Credit to Alex Ravsky: https://math.stackexchange.com/a/2442870/207264
-//   - Adds a little bit of extra communication at the end to make it so that if
+//
+//   - instead of sharing n^2 secrets, we just share s[1],..,s[n] and take
+//     the (i, j) secret to be F(s[i], j+tag), where F is a threshold prf.
+//
+//   - most of the protocol is done only once to derive the shared secrets; after
+//     that we just change the tag in the threshold prf to derive repeated coin shares.
+//
+//   - the analysis above setupKeygenProposalsStable is tighter than the overlap
+//     proven in the original paper. to better utilize the tighter overlap bound,
+//     we increase u to n+1 which makes the coin common-random more often.
+//     specifically, Pr[c=1 for all nodes], Pr[c=0 for all nodes] >= 0.36 for n >= 4.
+//
+//   - we add a little bit of extra communication at the end to make it so that if
 //     any node terminates setup with the support set Z, then Z is contained in G.
-//     This allows us to lock G in place so that even if we later add a node to G,
+//     this allows us to lock G in place so that even if we later add a node to G,
 //     we won't need to reconstruct the share corresponding to this node.
+//
+// the general idea of Canetti's protocol is to assign to each node a shared secret,
+// then use those secrets to flip n coins, each from the range [0,1,2,...,u-1]. the common
+// coin is then 0 if any local coin landed on 0, and 1 otherwise.
+// by using the stabilized keygen algorithm above, we guarantee that the coins each node
+// is waiting from (that is, the coins from nodes in Z) have a large overlap. thus if
+// any node in this overlap's coin lands on 0 (constant prob), then every node sees 0 for
+// the common coin.
+// on the other hand, with constant probability NONE of the local coins will land on 0,
+// in which case every node sees 1 for the common coin.
 async function setupHeavyCommonCoin(tag, broker, reliableBroadcast, reliableReceive) {
   const n = broker.n, f = (n - 1)/3|0
   
   const { Z, G, As, shares:keys }
     = await setupKeygenProposalsStable(tag+'s', broker, reliableBroadcast, reliableReceive)
   
+  // combine threshold secrets to produce our share of the shared secret assigned to each node.
   const Akeys = arrayOf(n, i => As[i] && ({
     share: add(...As[i].map(j => keys[j].share)),
-    maskShare: add(...As[i].map(j => keys[j].maskShare)),
-    skCommit: add(...As[i].map(j => keys[j].skCommit)),
-    shareCommits: arrayOf(n, x => add(...As[i].map(j => keys[j].shareCommits[x])))
+    pk: add(...As[i].map(j => keys[j].pk)),
+    pubShares: arrayOf(n, x => add(...As[i].map(j => keys[j].pubShares[x])))
   }))
   
   function thresholdPRF(i, tag_) {
-    const { share, maskShare, skCommit } = Akeys[i]
-    const id = skCommit.encodeStr()+' '+i+' '+tag.length+tag+tag_
-    return chaumPedersenPHProve(share, maskShare, id)
+    const { share, pk } = Akeys[i]
+    // we want to produce sk*hashToPoint(id), where sk is the shared secret assigned to i.
+    const id = pk.encodeStr()+' '+i+' '+tag.length+tag+tag_
+    return chaumPedersenProve(share, id)
   }
   
   function verifyPRFShare(i, tag_, sender, PRFShare) {
-    const { shareCommits, skCommit } = Akeys[i]
-    const id = skCommit.encodeStr()+' '+i+' '+tag.length+tag+tag_
-    return chaumPedersenPHVerify(shareCommits[sender], id, PRFShare)
+    const { pubShares, pk } = Akeys[i]
+    const id = pk.encodeStr()+' '+i+' '+tag.length+tag+tag_
+    return chaumPedersenVerify(pubShares[sender], id, PRFShare)
   }
   
+  // after we've gone through the setup once, we return a much lighter function that can be called
+  // with a subtag tag_ to run an individual coin instance.
   return (tag_) => {
     const result = defer()
     
+    // produce our share of each node's shared secret for every node in G
     const shares = G.reduce((acc, i) => [...acc, [i, encodeData(thresholdPRF(i, tag_))]], [])
     broker.broadcast(tag+tag_, JSON.stringify(shares))
     
+    // acceptedCoinShares[i][j] contains j's coin share of the local coin corresponding to i.
     const acceptedCoinShares = arrayOf(n, () => arrayOf(n))
     let count = 0
     broker.receive(tag+tag_, (i, m) => {
       const verifiedShares = arrayOf(n)
+      
+      // for each PRFshare i sent us, verify the CP proof on it
       let otherShares
       try {
         otherShares = JSON.parse(m).map(([j, PRFShareRaw]) => {
-          decodeData(PRFShareRaw, chaumPedersenPHDecode, PRFShare => {
+          // TODO we really only need to check the proofs for nodes in Z.
+          decodeData(PRFShareRaw, chaumPedersenDecode, PRFShare => {
             if (verifyPRFShare(j, tag_, i, PRFShare)) verifiedShares[j] = PRFShare[0]
           })
         })
       } catch (e) { return }
       
-      console.log(verifiedShares)
-      
+      // i should have sent us a PRFshare for every node in Z. if not we reject.
       if (Z.every(j => verifiedShares[j])) {
         verifiedShares.forEach((sig, j) => acceptedCoinShares[j][i] = sig)
         count++
-      }
+      } else return;
       
       if (count >= f+1) {
+        // reconstruct all the local coins from nodes in Z and set common coin to 1 iff all
+        // local coins didn't land on 0.
         result.resolve(Z.map(j => interpolate(acceptedCoinShares[j]))
-                       .every(sig => !(hashToScalar(sig.encodeStr()).val.modn(n+1) === 0)))
-        console.log(Z.map(j => interpolate(acceptedCoinShares[j]))
-                       .map(sig => hashToScalar(sig.encodeStr()).val.modn(n+1)))
+                        .every(sig => hashToScalar(sig.encodeStr()).val.modn(n+1) !== 0))
       }
     })
     
@@ -1036,6 +1097,8 @@ async function setupHeavyCommonCoin(tag, broker, reliableBroadcast, reliableRece
   }
 }
 
+// each node deals an AVSS secret, then we run consensus to agree on a large set of secrets
+// whose AVSS succeeded and add them all together to get the common shared secret.
 async function keyGenAsync(tag, broker, reliableBroadcast, reliableReceive, setupConsensus) {
   const n = broker.n, f = (n-1)/3|0
   const result = defer()
@@ -1056,31 +1119,10 @@ async function keyGenAsync(tag, broker, reliableBroadcast, reliableReceive, setu
   const shares_ = await Promise.all(shares.filter((_, i) => A.includes(i)))
   
   const share = add(...shares_.map(s => s.share))
-  const maskShare = add(...shares_.map(s => s.maskShare))
-  const skCommit = add(...shares_.map(s => s.skCommit))
-  const shareCommits = arrayOf(n, x => add(...shares_.map(s => s.shareCommits[x])))
+  const pk = add(...shares_.map(s => s.pk))
+  const pubShares = arrayOf(n, x => add(...shares_.map(s => s.pubShares[x])))
   
-  broker.broadcast(tag+'f', encodeData(pedersenPKProve(share, maskShare)))
-  
-  const pks = arrayOf(n)
-  let count = 0
-  broker.receive(tag+'f', (i, m) => {
-    decodeData(m, pedersenPKDecode, ([ pk, proof ]) => {
-      if (pedersenPKVerify([ pk, proof ], shareCommits[i])) {
-        pks[i] = pk
-        count++
-        
-        if (count >= f+1) {
-          const sharePKs = arrayOf(n, i => pks[i]||interpolate(pks, i+1))
-          const pk = interpolate(pks)
-          
-          result.resolve({ share, sharePKs, pk })
-        }
-      }
-    })
-  })
-  
-  return result.promise
+  return { share, sharePKs:pubShares, pk }
 }
 
 async function thresholdECDSA(tag, broker, sk, pks, msg, keyGen) {
