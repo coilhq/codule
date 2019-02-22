@@ -641,12 +641,12 @@ function setupCommonCoin(tag, broker, share, pubShares) {
 //   - onAddToG: a callback that can be called whenever a new node is added to G.
 //
 // NOTE some nodes may be assigned the same shared secret.
-function setupKeygenProposals(tag, broker, reliableBroadcast, reliableReceive) {
+function setupKeygenProposals(tag, broker, reliableBroadcast, reliableReceive, newSecret = () => genSk()) {
   const n = broker.n, f = (n - 1)/3|0
   const result = defer()
 
   // each node deals a secret
-  const r = genSk()
+  const r = newSecret()
   AVSSDeal(tag+'a'+broker.thisHostIndex, r, broker)
   
   // participate as a receiver in every node's AVSS instance
@@ -769,7 +769,7 @@ function setupKeygenProposals(tag, broker, reliableBroadcast, reliableReceive) {
 // a subset of G with the same intersection properties as above, and G contains every other node's Z.
 // this allows us to avoid needing to continue keeping track of new additions to G for the sake of
 // validity checking other nodes' outputs.
-async function setupKeygenProposalsStable(tag, broker, reliableBroadcast, reliableReceive) {
+async function setupKeygenProposalsStable(tag, broker, reliableBroadcast, reliableReceive, newSecret = () => genSk()) {
   const n = broker.n, f = (n - 1)/3|0
   const result = defer()
   
@@ -781,7 +781,7 @@ async function setupKeygenProposalsStable(tag, broker, reliableBroadcast, reliab
   
   
   const { G, As, shares, onAddToG } = 
-    await setupKeygenProposals(tag, broker, reliableBroadcast, reliableReceive)
+    await setupKeygenProposals(tag, broker, reliableBroadcast, reliableReceive, newSecret)
   
   // our view of G contains n-f nodes at this point; reliably broadcast it
   reliableBroadcast(tag+'g'+broker.thisHostIndex, JSON.stringify(G), broker)
@@ -936,11 +936,11 @@ async function setupKeygenProposalsStable(tag, broker, reliableBroadcast, reliab
 // the common coin.
 // on the other hand, with constant probability NONE of the local coins will land on 0,
 // in which case every node sees 1 for the common coin.
-async function setupHeavyCommonCoin(tag, broker, reliableBroadcast, reliableReceive) {
+async function setupHeavyCommonCoin(tag, broker, reliableBroadcast, reliableReceive, newSecret = () => genSk()) {
   const n = broker.n, f = (n - 1)/3|0
   
   const { Z, G, As, shares:keys }
-    = await setupKeygenProposalsStable(tag+'s', broker, reliableBroadcast, reliableReceive)
+    = await setupKeygenProposalsStable(tag+'s', broker, reliableBroadcast, reliableReceive, newSecret)
   
   // combine threshold secrets to produce our share of the shared secret assigned to each node.
   const Akeys = arrayOf(n, i => As[i] && ({
@@ -1008,12 +1008,12 @@ async function setupHeavyCommonCoin(tag, broker, reliableBroadcast, reliableRece
 
 // each node deals an AVSS secret, then we run consensus to agree on a large set of secrets
 // whose AVSS succeeded and add them all together to get the common shared secret.
-async function keyGenAsync(tag, broker, reliableBroadcast, reliableReceive, setupConsensus) {
+async function keyGenAsync(tag, broker, reliableBroadcast, reliableReceive, setupConsensus, newSecret = () => genSk()) {
   const n = broker.n, f = (n-1)/3|0
   const result = defer()
   
   const proposals =
-    setupKeygenProposals(tag+'g', broker, reliableBroadcast, reliableReceive)
+    setupKeygenProposals(tag+'g', broker, reliableBroadcast, reliableReceive, newSecret)
   
   const consensusSetup = setupConsensus(tag+'c', broker)
   
