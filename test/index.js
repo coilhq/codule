@@ -1,5 +1,5 @@
 const broker = require('n-squared')()
-const { setupHeavyCommonCoin, setupCommonCoin, keyGenAsync, thresholdECDSA } = require('threshodl')
+const { setupHeavyCommonCoin, setupCommonCoin, keyGenAsync, thresholdECDSA, genSk, hashToScalar } = require('threshodl')
 const { brachaBroadcast, brachaReceive, setupMostefaouiConsensus } = require('basic-byzantine')
 
 function defer() {
@@ -12,20 +12,12 @@ module.exports = async function () {
   const n = broker.n
   console.log = function() {}
   
-  /*
-  const coinInstances = [...Array(1000)]
-  for (let i = 0; i < 1000; i++) {
-    console.error('starting flip #' + i)
-    coinInstances[i] = coin('test'+i)
-    if (i % 100 === 99) await Promise.all(coinInstances.slice(0, i))
-  }
+  const sk = genSk()
   
-  const flips = await Promise.all(coinInstances)
-  
-  console.error('\x1b[36m%s\x1b[0m', 'total heads: ' + flips.reduce((c, t) => t ? c+1 : c, 0))*/
+  const newSk = (tag) => ((subtag) => hashToScalar(sk.encodeStr() + '||subkey||' + tag + '||subtag||' + subtag))
   
   const setupConsensus = async (tag, broker) => {
-    const coin = await setupHeavyCommonCoin(tag+'hcc', broker, brachaBroadcast, brachaReceive)
+    const coin = await setupHeavyCommonCoin(tag+'hcc', broker, brachaBroadcast, brachaReceive, newSk(tag+'hcc'))
     
     const sharedCoinsQueried = new Map()
     const sharedCoins = [...Array(n)].map((_, i) => {
@@ -56,7 +48,7 @@ module.exports = async function () {
   }
   
   const { share:sk, sharePKs:pks, pk } = 
-    await keyGenAsync('tagABC', broker, brachaBroadcast, brachaReceive, setupConsensus)
+    await keyGenAsync('tagABC', broker, brachaBroadcast, brachaReceive, setupConsensus, newSk('tagABC'))
   
   console.error('secret key share: ' + sk.val.toString('hex'))
   console.error('public key: ' + pk.val.encodeCompressed('hex'))
@@ -92,8 +84,8 @@ module.exports = async function () {
     }
   }
   
-  const keyGen = (tag, broker) => {
-    return keyGenAsync(tag, broker, brachaBroadcast, brachaReceive, setupFastConsensus)
+  const keyGen = (tag, broker, subtag) => {
+    return keyGenAsync(tag, broker, brachaBroadcast, brachaReceive, setupFastConsensus, newSk(tag+'||'+subtag))
   }
   
   let iteration = 0
