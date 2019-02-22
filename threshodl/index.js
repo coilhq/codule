@@ -1218,5 +1218,6 @@ module.exports = {
   setupHeavyCommonCoin,
   setupCommonCoin,
   keyGenAsync,
-  thresholdECDSA
+  thresholdECDSA,
+  genSk
 }
