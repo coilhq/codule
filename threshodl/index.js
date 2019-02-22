@@ -646,7 +646,7 @@ function setupKeygenProposals(tag, broker, reliableBroadcast, reliableReceive, n
   const result = defer()
 
   // each node deals a secret
-  const r = newSecret()
+  const r = newSecret(tag)
   AVSSDeal(tag+'a'+broker.thisHostIndex, r, broker)
   
   // participate as a receiver in every node's AVSS instance
@@ -1219,5 +1219,6 @@ module.exports = {
   setupCommonCoin,
   keyGenAsync,
   thresholdECDSA,
-  genSk
+  genSk,
+  hashToScalar
 }
