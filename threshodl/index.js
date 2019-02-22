@@ -318,31 +318,6 @@ function merkleBranchVerify(leaf, datum, branch, root) {
 
 // ------------------- Zero-knowedge proofs -------------------------
 
-// --- Schnorr proofs --- //
-// Schnorr proofs allow you to prove in zero knowledge that you know some
-// scalar sk such that pk = sk*G.
-
-// format: [ challenge, response ]
-const schnorrDecode = ['S', 'S']
-
-function schnorrSign(sk, m) {
-  // using deterministic nonces for safety
-  const nonce = hashToScalar(m.length + '||schnorr||' + hashToString(sk.encodeStr()) + '||' + m)
-  const pubNonce = nonce.mul(G)
-  
-  // TODO might as well hash the public key in here as well
-  const c = hashToScalar(pubNonce.encodeStr() + '||' + m)
-
-  return [ c, nonce.sub(sk.mul(c)) ]
-}
-
-function schnorrVerify(pk, m, [ c, z ]) {
-  const pubNonce_ = z.mul(G).add(pk.mul(c))
-  const c_ = hashToScalar(pubNonce_.encodeStr() + '||' + m)
-  
-  return c.equals(c_)
-}
-
 // --- Chaum-Pedersen proofs --- //
 // Chaum-Pedersen proofs allow you to prove in zero knowledge that
 // a given set of elliptic curve points are Diffie-Hellman triples.
@@ -377,72 +352,6 @@ function chaumPedersenVerify(pk, m, [ sig, [ c, z ] ]) {
   const c_ = hashToScalar(pubNonceG_.encodeStr() + '||' + pubNonceH_.encodeStr())
   
   return c.equals(c_)
-}
-
-// produce a perfect-hiding commitment to val.
-// the commitment is c = val*G + mask*G1. if mask is random, this reveals
-// nothing (information theoretically) about val. however producing
-// (val',mask') such that c = val'*G + mask'*G1 is hard without knowledge
-// of the discrete log of G1.
-function pedersenCommit(val, mask) {
-  if (!mask) mask = genSk()
-  return val.mul(G).add(mask.mul(G1))
-}
-
-function pedersenVerify(val, mask, commitment) {
-  return pedersenCommit(val, mask).equals(commitment)
-}
-
-// --- Perfect hiding Chaum-Pedersen proofs --- //
-// these proofs are similar to standard CP proofs, except instead of using
-// pk = sk*G, we instead use a Pedersen commitment to sk.
-//
-// NOTE this protocol is UNSAFE to use with curves that have a cofactor!
-
-// format: [ sig, proof=[ challenge, response1, response2 ] ]
-const chaumPedersenPHDecode = ['P', ['S', 'S', 'S']]
-
-function chaumPedersenPHProve(sk, mask, m) {
-  const H = hashToPoint(m)
-  
-  // using deterministic nonces for safety
-  const nonce = hashToScalar(m.length + '||CPPH0||' + hashToString(sk.encodeStr()) + '||' + m)
-  const nonce1 = hashToScalar(m.length + '||CPPH1||' + hashToString(sk.encodeStr()) + '||' + m)
-  const pubNonceG = nonce.mul(G).add(nonce1.mul(G1))
-  const pubNonceH = nonce.mul(H)
-  
-  const c = hashToScalar(pubNonceG.encodeStr() + '||' + pubNonceH.encodeStr())
-
-  return [ sk.mul(H), [ c, nonce.sub(sk.mul(c)), nonce1.sub(mask.mul(c)) ] ]
-}
-
-function chaumPedersenPHVerify(commit, m, [ sig, [ c, z, z1 ] ]) {
-  const H = hashToPoint(m)
-  const pubNonceG_ = z.mul(G).add(z1.mul(G1)).add(commit.mul(c))
-  const pubNonceH_ = z.mul(H).add(sig.mul(c))
-  const c_ = hashToScalar(pubNonceG_.encodeStr() + '||' + pubNonceH_.encodeStr())
-  
-  return c.equals(c_)
-}
-
-// --- Perfect hiding Chaum-Pedersen proofs --- //
-// these proofs are similar to standard CP proofs, except instead of using
-// pk = sk*G, we instead use pk = sk*G + mask*G1. this reveals no information
-// about sk (information theoretically), but it's computationally difficult to
-// find sk',mask' such that pk = sk'*G + mask'*G1.
-//
-// NOTE this protocol is UNSAFE to use with curves that have a cofactor!
-
-// format: [ sig, proof=[ challenge, response1, response2 ] ]
-const pedersenPKDecode = ['P', ['S', schnorrDecode]]
-
-function pedersenPKProve(val, mask) {
-  const pk = val.mul(G)
-  return [ pk,  [ mask, schnorrSign(val, '') ] ]
-}
-
-function pedersenPKVerify([ pk, [ mask, sig ] ], commitment) {
-  return (pk.add(mask.mul(G1)).equals(commitment) && schnorrVerify(pk, '', sig))
 }
 
 // ---------------------------------------------------------------
@@ -1125,9 +1034,16 @@ async function keyGenAsync(tag, broker, reliableBroadcast, reliableReceive, setu
   return { share, sharePKs:pubShares, pk }
 }
 
-async function thresholdECDSA(tag, broker, sk, pks, msg, keyGen) {
+// interactively construct a DER-encoded ECDSA signature over msg using a pre-shared secret key.
+// keyGen(subtag, broker, sk) should be a callable subprotocol that returns a promise for a new
+// threshold shared secret for which no one knows the interpolated secret key, using sk to
+// deterministically generate randomness.
+//
+// NOTE msg does NOT need to be pre-hashed.
+async function thresholdECDSA(tag, broker, share, pubShares, msg, keyGen) {
   const n = broker.n, f = (n-1)/3|0
   
+  // turns a 256-bit byte-string into a scalar from the same equivalence class.
   function truncateToN(msg, truncOnly) {
     const delta = msg.byteLength() * 8 - ecc.curve.n.bitLength()
     if (delta > 0)
@@ -1138,6 +1054,7 @@ async function thresholdECDSA(tag, broker, sk, pks, msg, keyGen) {
       return msg
   }
   
+  // black-box DER encoding function for Bitcoin compatibility. stolen from elliptic.js.
   function toDER(r, s) {
     r = r.toArray()
     s = s.toArray()
@@ -1195,44 +1112,45 @@ async function thresholdECDSA(tag, broker, sk, pks, msg, keyGen) {
     return Buffer.from(res).toString('hex')
   }
   
+  // following Bitcoin convention, hash and then truncate to a scalar.
   const msgHash = scalar(truncateToN(new BN(sha512_256(msg), 16)))
 
-  // Zero-extend key to provide enough entropy
-  const bytes = ecc.curve.n.byteLength()
-  let bkey = sk.val.toArray('be', bytes)
-
-  // Zero-extend nonce to have the same byte size as N
-  const nonce = msgHash.val.toArray('be', bytes)
-
-  // Number of bytes to generate
-  const ns1 = ecc.curve.n.sub(new BN(1));
-
+  // this loop is a sanity check; if everything is working right it should never go more than once.
   for (let iter = 0; true; iter++) {
-    // Computes kInv by generating shares of a second random secret b, then revealing k*b
+    // computes kInv by generating shares of a second random secret b, then revealing k*b
     // and applying the linear function x->x/(k*b) to our share of b.
     const kAndKInv = defer()
     {
-      const [{ share:k, sharePKs:kSharePKs, pk:kPK }, { share:b, sharePKs:bSharePKs, pk:bPK }] =
-        await Promise.all([ keyGen(tag+'n'+iter+'_', broker),
-                            keyGen(tag+'b'+iter+'_', broker) ])
+      const [{ share:kShare, sharePKs:kSharePKs, pk:kPK }, { share:bShare, sharePKs:bSharePKs, pk:bPK }] =
+        await Promise.all([ keyGen(tag+'n'+iter+'_', broker, hashToStr(share.encodeStr()+'||'+tag+'n'+iter+'_')),
+                            keyGen(tag+'b'+iter+'_', broker, hashToStr(share.encodeStr()+'||'+tag+'b'+iter+'_')) ])
       
-      const kbShare = k.mul(b), proof = chaumPedersenProve(k, bSharePKs[broker.thisHostIndex])
-      broker.broadcast(tag+'r'+iter, encodeData([ kbShare, proof ]))
+      // since kShare and bShare are shares of secrets with threshold f+1, kShare*bShare is a share of
+      // k*b with threshold 2*f+1.
+      const kbShare = kShare.mul(bShare)
+      
+      // (kShare*bShare)*G = kShare*(bShare*G), so we can use a CP proof to prove that kbSharePK is
+      // correct, which proves kbShare is correct by checking kbShare*G = kbSharePK
+      const [ kbSharePK, proof ] = chaumPedersenProve(kShare, bSharePKs[broker.thisHostIndex])
+      broker.broadcast(tag+'r'+iter, encodeData([ kbShare, [ kbSharePK, proof ] ]))
       
       const kbShares = arrayOf(n)
       let count = 0, finished = false
       broker.receive(tag+'r'+iter, (i, m) => {
         if (finished) return;
-        decodeData(m, ['S', chaumPedersenDecode], ([ kbShare, proof ]) => {
-          if (chaumPedersenVerify(kSharePKs[i], bSharePKs[i], proof) &&
-              proof[0].equals(kbShare.mul(G))) {
+        decodeData(m, ['S', chaumPedersenDecode], ([ kbShare, [ kbSharePK, proof ] ]) => {
+          if (chaumPedersenVerify(kSharePKs[i], bSharePKs[i], [ kbSharePK, proof ])
+              && kbSharePK.equals(kbShare.mul(G))) {
             kbShares[i] = kbShare
             count++
             
             if (count === 2*f+1) {
               const kb = interpolate(kbShares)
-              if (kb.val.fromRed().cmpn(0) === 0) kAndKInv.resolve([ ])
-              else kAndKInv.resolve([ k, b.div(kb), bSharePKs.map(pk => pk.div(kb)), kPK ])
+              if (kb.val.fromRed().cmpn(0) === 0) kAndKInv.resolve([ ]) // shouldn't ever happen
+              else {
+                // bShare/kb is a share of 1/k with threshold f+1
+                kAndKInv.resolve([ kShare, bShare.div(kb), bSharePKs.map(pk => pk.div(kb)), kPK ])
+              }
               finished = true
             }
           }
@@ -1240,28 +1158,32 @@ async function thresholdECDSA(tag, broker, sk, pks, msg, keyGen) {
       })
     }
     
-    let [ k, kInv, kInvSharePKs, kPK ] = await kAndKInv.promise
+    let [ kShare, kInvShare, kInvSharePKs, kPK ] = await kAndKInv.promise
     
-    if (!k) continue;
+    if (!kShare) continue; // shouldn't ever happen
 
     const kpX = kPK.val.getX()
     const r = scalar(kpX.umod(ecc.curve.n))
-    if (r.val.cmpn(0) === 0) continue;
+    if (r.val.cmpn(0) === 0) continue; // shouldn't ever happen
     
-    const sShare = kInv.mul(r.mul(sk).add(msgHash))
+    // share of (r*sk + msgHash)/k with threshold 2*f+1, where sk is the shared secret
+    // interpolated from share.
+    const sShare = kInvShare.mul(r.mul(share).add(msgHash))
     
     const sp = defer()
     {
-      const proof = chaumPedersenProve(sk, kInvSharePKs[broker.thisHostIndex])
+      // since r and msgHash are publicly known to all nodes, it suffices to produce a CP
+      // proof for share*kInvShare; then sShare should just be r*share*kInvShare + msgHash*kInvShare.
+      const proof = chaumPedersenProve(share, kInvSharePKs[broker.thisHostIndex])
       broker.broadcast(tag+'s'+iter, encodeData([ sShare, proof ]))
       
       const sShares = arrayOf(n)
       let count = 0, finished = false
       broker.receive(tag+'s'+iter, (i, m) => {
         if (finished) return;
-        decodeData(m, ['S', chaumPedersenDecode], ([ sShare, proof ]) => {
-          if (chaumPedersenVerify(pks[i], kInvSharePKs[i], proof) &&
-              proof[0].mul(r).add(kInvSharePKs[i].mul(msgHash))
+        decodeData(m, ['S', chaumPedersenDecode], ([ sShare, [ skOverKSharePK, proof ] ]) => {
+          if (chaumPedersenVerify(pubShares[i], kInvSharePKs[i], [ skOverKSharePK, proof ]) &&
+              skOverKSharePK.mul(r).add(kInvSharePKs[i].mul(msgHash))
                 .equals(sShare.mul(G))) {
             sShares[i] = sShare
             count++
@@ -1277,13 +1199,12 @@ async function thresholdECDSA(tag, broker, sk, pks, msg, keyGen) {
     
     let s = (await sp.promise).val.fromRed()
     
-    if (s.cmpn(0) === 0)
-      continue;
+    if (s.cmpn(0) === 0) continue; // shouldn't ever happen
 
     let recoveryParam = (kPK.val.getY().isOdd() ? 1 : 0) |
                         (kpX.cmp(r) !== 0 ? 2 : 0)
 
-    // Use complement of `s`, if it is > `n / 2`
+    // DER-encoding detail
     if (s.cmp(ecc.nh) > 0) {
       s = ecc.curve.n.sub(s)
       recoveryParam ^= 1
