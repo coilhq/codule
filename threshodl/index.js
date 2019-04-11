@@ -146,7 +146,7 @@ function sha512_256(m) {
 
 // hash m to a uniformly distributed scalar
 function hashToScalar(m) {
-  while (true) {
+  for (let i = 0; ; i++) {
     const r = new BN(hashToBuf(i+'||'+m))
     
     // check if byte sequence lies outside the scalar field
@@ -615,7 +615,7 @@ function setupCommonCoin(tag, broker, share, pubShares) {
           if (count >= f+1) {
             // the coin value is the string hash of p(0), where p is the polynomial interpolating
             // [ i+1, share[i]*hashToPoint(id) ] for each node i.
-            result.resolve(hashToStr(interpolate(coinShares)))
+            result.resolve(hashToStr(interpolate(coinShares).encodeStr()))
           }
         }
       })
