@@ -11,6 +11,6 @@
   "dependencies": {
     "reconnecting-websocket": "^4.0.0-rc3",
     "tweetnacl": "^1.0.0",
-    "ws": "^5.2.0"
+    "ws": "^7.4.6"
   }
 }
